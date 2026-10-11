@@ -7,20 +7,46 @@ use serde_json::{json, Value};
 use crate::model::{is_valid_id, parse_clock, Track};
 
 const ENDPOINT: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
+const BROWSE_ENDPOINT: &str = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false";
 const SONGS_FILTER: &str = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
+const ARTISTS_FILTER: &str = "EgWKAQIgAWoMEA4QChADEAQQCRAF";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 const FALLBACK_COUNT: usize = 25;
 
+pub struct Page {
+    pub tracks: Vec<Track>,
+    pub next: Option<String>,
+}
+
+impl From<Vec<Track>> for Page {
+    fn from(tracks: Vec<Track>) -> Self {
+        Page { tracks, next: None }
+    }
+}
+
 pub fn search(query: &str) -> Result<Vec<Track>, String> {
+    search_page(query).map(|p| p.tracks)
+}
+
+pub fn search_page(query: &str) -> Result<Page, String> {
     match search_innertube(query) {
-        Ok(tracks) if !tracks.is_empty() => Ok(tracks),
-        Ok(_) => ytdlp_search(query).map_err(|e| format!("{e:#}")),
-        Err(primary) => ytdlp_search(query).map_err(|fallback| {
+        Ok(page) if !page.tracks.is_empty() => Ok(page),
+        Ok(_) => ytdlp_search(query)
+            .map(Page::from)
+            .map_err(|e| format!("{e:#}")),
+        Err(primary) => ytdlp_search(query).map(Page::from).map_err(|fallback| {
             format!(
                 "YouTube Music search failed ({primary:#}); yt-dlp fallback failed ({fallback:#})"
             )
         }),
     }
+}
+
+pub fn search_more(token: &str) -> Result<Page, String> {
+    let url = format!("{ENDPOINT}&ctoken={token}&continuation={token}");
+    post(&url, json!({}))
+        .map(|v| page_from(&v))
+        .map_err(|e| format!("{e:#}"))
 }
 
 pub fn import(url: &str) -> Result<Vec<Track>, String> {
@@ -53,7 +79,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn search_innertube(query: &str) -> Result<Vec<Track>> {
+fn search_innertube(query: &str) -> Result<Page> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(12))
         .user_agent(UA)
@@ -78,7 +104,90 @@ fn search_innertube(query: &str) -> Result<Vec<Track>> {
     let v: Value = resp
         .into_json()
         .context("invalid JSON from YouTube Music")?;
-    Ok(parse_search_response(&v))
+    Ok(page_from(&v))
+}
+
+fn page_from(v: &Value) -> Page {
+    Page {
+        tracks: parse_search_response(v),
+        next: find_continuation(v),
+    }
+}
+
+fn find_continuation(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            let token = map
+                .get("nextContinuationData")
+                .and_then(|c| c.get("continuation"))
+                .or_else(|| {
+                    map.get("continuationCommand")
+                        .and_then(|c| c.get("token"))
+                })
+                .and_then(Value::as_str);
+            match token {
+                Some(t) => Some(t.to_string()),
+                None => map.values().find_map(find_continuation),
+            }
+        }
+        Value::Array(arr) => arr.iter().find_map(find_continuation),
+        _ => None,
+    }
+}
+
+fn post(url: &str, mut body: Value) -> Result<Value> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .user_agent(UA)
+        .build();
+    body["context"] = json!({ "client": {
+        "clientName": "WEB_REMIX",
+        "clientVersion": client_version(),
+        "hl": "en",
+        "gl": "US",
+    }});
+    let resp = agent
+        .post(url)
+        .set("Origin", "https://music.youtube.com")
+        .set("Referer", "https://music.youtube.com/")
+        .set("Cookie", "SOCS=CAI")
+        .send_json(body)
+        .map_err(|e| anyhow!("request failed: {e}"))?;
+    resp.into_json::<Value>()
+        .context("invalid JSON from YouTube Music")
+}
+
+pub fn artist_top_songs(name: &str) -> Result<Vec<Track>, String> {
+    let fetch = || -> Result<Vec<Track>> {
+        let found = post(ENDPOINT, json!({ "query": name, "params": ARTISTS_FILTER }))?;
+        let Some(id) = pick_artist_id(&found, name) else {
+            return Ok(Vec::new());
+        };
+        let page = post(BROWSE_ENDPOINT, json!({ "browseId": id }))?;
+        Ok(parse_search_response(&page))
+    };
+    fetch().map_err(|e| format!("{e:#}"))
+}
+
+fn pick_artist_id(v: &Value, name: &str) -> Option<String> {
+    let mut items = Vec::new();
+    collect_items(v, &mut items);
+    let artists: Vec<(String, &str)> = items
+        .into_iter()
+        .filter_map(|item| {
+            let id = item
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")?
+                .as_str()?;
+            let title = column_segments(item, 0).into_iter().next()?;
+            id.starts_with("UC").then_some((title, id))
+        })
+        .collect();
+    let wanted = name.to_lowercase();
+    artists
+        .iter()
+        .find(|(title, _)| title.to_lowercase() == wanted)
+        .or(artists.first())
+        .map(|(_, id)| id.to_string())
 }
 
 fn collect_items<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
@@ -321,6 +430,36 @@ not json
         assert_eq!(t.len(), 1);
         assert_eq!(t[0].artist, "Rick");
         assert_eq!(t[0].duration, Some(213));
+    }
+
+    #[test]
+    fn picks_artist_by_name() {
+        let artist = |name: &str, id: &str| {
+            json!({"musicResponsiveListItemRenderer": {
+                "navigationEndpoint": {"browseEndpoint": {"browseId": id}},
+                "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": run(name)}]
+            }})
+        };
+        let resp = json!({"contents": [
+            artist("Daft Punk Tribute", "UCaaa"),
+            artist("Daft Punk", "UCbbb"),
+        ]});
+        assert_eq!(pick_artist_id(&resp, "daft punk").as_deref(), Some("UCbbb"));
+        assert_eq!(pick_artist_id(&resp, "Other").as_deref(), Some("UCaaa"));
+        assert_eq!(pick_artist_id(&json!([]), "x"), None);
+    }
+
+    #[test]
+    fn finds_continuation_tokens() {
+        let old = json!({"musicShelfRenderer": {"contents": [], "continuations": [
+            {"nextContinuationData": {"continuation": "abc%3D", "clickTrackingParams": "x"}}
+        ]}});
+        assert_eq!(find_continuation(&old).as_deref(), Some("abc%3D"));
+        let new = json!([{"continuationItemRenderer": {"continuationEndpoint": {
+            "continuationCommand": {"token": "def", "request": "CONTINUATION_REQUEST_TYPE_SEARCH"}
+        }}}]);
+        assert_eq!(find_continuation(&new).as_deref(), Some("def"));
+        assert_eq!(find_continuation(&json!({"a": [1, 2]})), None);
     }
 
     #[test]

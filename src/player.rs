@@ -1,11 +1,113 @@
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+
+/// Platform-specific transport for mpv's JSON IPC.
+/// Unix: a Unix domain socket. Windows: a named pipe (`\\.\pipe\...`).
+#[cfg(unix)]
+mod ipc {
+    use std::io;
+    use std::os::unix::net::UnixStream;
+    use std::path::{Path, PathBuf};
+
+    pub type Reader = UnixStream;
+    pub type Writer = UnixStream;
+
+    pub fn endpoint() -> PathBuf {
+        let dir = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
+        let path = dir.join(format!("drift-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    pub fn connect(path: &Path) -> io::Result<(Reader, Writer)> {
+        let stream = UnixStream::connect(path)?;
+        let reader = stream.try_clone()?;
+        Ok((reader, stream))
+    }
+
+    pub fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
+mod ipc {
+    use std::ffi::c_void;
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Read};
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    pub type Writer = File;
+
+    extern "system" {
+        fn PeekNamedPipe(
+            pipe: *mut c_void,
+            buffer: *mut c_void,
+            buffer_size: u32,
+            bytes_read: *mut u32,
+            total_bytes_avail: *mut u32,
+            bytes_left_this_message: *mut u32,
+        ) -> i32;
+    }
+
+    /// Reader half of the pipe.
+    ///
+    /// A blocking `ReadFile` on a synchronous pipe handle also blocks any
+    /// `WriteFile` on a clone of that handle, which would deadlock the player.
+    /// So we poll with `PeekNamedPipe` and only read when data is waiting.
+    pub struct Reader(File);
+
+    impl Read for Reader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            loop {
+                let mut avail: u32 = 0;
+                let ok = unsafe {
+                    PeekNamedPipe(
+                        self.0.as_raw_handle() as *mut c_void,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut avail,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    // mpv exited / pipe closed: report EOF.
+                    return Ok(0);
+                }
+                if avail > 0 {
+                    let n = (avail as usize).min(buf.len());
+                    return self.0.read(&mut buf[..n]);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    pub fn endpoint() -> PathBuf {
+        PathBuf::from(format!(r"\\.\pipe\drift-{}", std::process::id()))
+    }
+
+    pub fn connect(path: &Path) -> io::Result<(Reader, Writer)> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let reader = file.try_clone()?;
+        Ok((Reader(reader), file))
+    }
+
+    pub fn cleanup(_path: &Path) {
+        // Named pipes disappear when mpv exits.
+    }
+}
 
 #[derive(Debug)]
 pub enum PlayerEvent {
@@ -21,15 +123,13 @@ pub enum PlayerEvent {
 
 pub struct Player {
     child: Child,
-    writer: UnixStream,
+    writer: ipc::Writer,
     sock_path: PathBuf,
 }
 
 impl Player {
     pub fn spawn(volume: u8, on_event: impl Fn(PlayerEvent) + Send + 'static) -> Result<Player> {
-        let sock_dir = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
-        let sock_path = sock_dir.join(format!("drift-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&sock_path);
+        let sock_path = ipc::endpoint();
 
         let mut cmd = Command::new("mpv");
         cmd.args([
@@ -57,6 +157,7 @@ impl Player {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
+        // Linux only: ask the kernel to SIGTERM mpv if drift dies unexpectedly.
         #[cfg(target_os = "linux")]
         unsafe {
             use std::os::unix::process::CommandExt;
@@ -75,8 +176,8 @@ impl Player {
         })?;
 
         let start = Instant::now();
-        let stream = loop {
-            match UnixStream::connect(&sock_path) {
+        let (reader, writer) = loop {
+            match ipc::connect(&sock_path) {
                 Ok(s) => break s,
                 Err(e) => {
                     if let Ok(Some(status)) = child.try_wait() {
@@ -92,10 +193,9 @@ impl Player {
             }
         };
 
-        let reader = stream.try_clone().context("cloning mpv socket")?;
         let mut player = Player {
             child,
-            writer: stream,
+            writer,
             sock_path,
         };
 
@@ -174,7 +274,7 @@ impl Drop for Player {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.sock_path);
+        ipc::cleanup(&self.sock_path);
     }
 }
 

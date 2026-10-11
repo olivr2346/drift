@@ -48,10 +48,17 @@ impl Playback {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+pub struct Artist {
+    pub popular_first: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub playback: Playback,
+    pub artist: Artist,
 }
 
 impl Config {
@@ -59,7 +66,7 @@ impl Config {
         Ok(Store::dir()?.join("config.toml"))
     }
 
-    pub fn render(p: &Playback) -> String {
+    pub fn render(p: &Playback, a: &Artist) -> String {
         format!(
             "\
 # Drift settings. Drift only reads this file and never rewrites it, so your
@@ -73,6 +80,10 @@ autoplay = {autoplay}
 restore_session = {restore}
 seek_step = {seek:?}
 volume_step = {vstep:?}
+
+[artist]
+# :artist and ga list the artist's most popular songs first, then more of their songs below
+popular_first = {popular}
 ",
             volume = p.volume,
             shuffle = p.shuffle,
@@ -81,6 +92,7 @@ volume_step = {vstep:?}
             restore = p.restore_session,
             seek = p.seek_step,
             vstep = p.volume_step,
+            popular = a.popular_first,
         )
     }
 
@@ -95,7 +107,7 @@ volume_step = {vstep:?}
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = Self::write(&Self::render(&Playback::default()));
+                let _ = Self::write(&Self::render(&Playback::default(), &Artist::default()));
                 return (Config::default(), None);
             }
             Err(e) => {
@@ -174,7 +186,7 @@ pub fn migrate_legacy() {
             let _ = Session::write(&s);
         }
     }
-    let _ = Config::write(&Config::render(&p));
+    let _ = Config::write(&Config::render(&p, &Artist::default()));
 }
 
 #[cfg(test)]
@@ -183,13 +195,22 @@ mod tests {
 
     #[test]
     fn default_file_parses_back() {
-        let text = Config::render(&Playback::default());
+        let text = Config::render(&Playback::default(), &Artist::default());
         let c: Config = toml::from_str(&text).unwrap();
         let d = Playback::default();
         assert_eq!(c.playback.volume, d.volume);
         assert_eq!(c.playback.repeat, d.repeat);
         assert_eq!(c.playback.seek_step, 5.0);
         assert!(c.playback.restore_session);
+        assert!(!c.artist.popular_first);
+    }
+
+    #[test]
+    fn artist_section() {
+        let c: Config = toml::from_str("[artist]\npopular_first = true").unwrap();
+        assert!(c.artist.popular_first);
+        let c: Config = toml::from_str("[playback]\nvolume = 10").unwrap();
+        assert!(!c.artist.popular_first);
     }
 
     #[test]

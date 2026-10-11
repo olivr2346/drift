@@ -12,16 +12,24 @@ use crate::model::{split_artists, RepeatMode, Track};
 use crate::player::{Player, PlayerEvent};
 use crate::session::Session;
 use crate::store::Store;
-use crate::ytmusic;
+use crate::ytmusic::{self, Page};
 
 pub enum AppEvent {
     Player(u64, PlayerEvent),
     Results {
         id: u64,
         title: String,
-        result: Result<Vec<Track>, String>,
+        result: Result<Page, String>,
+    },
+    More {
+        generation: u64,
+        result: Result<Page, String>,
     },
 }
+
+const FIRST_PAGE: usize = 20;
+const NEXT_PAGE: usize = 10;
+const LOAD_AHEAD: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -103,11 +111,16 @@ pub struct App {
     played: HashSet<usize>,
     fail_streak: u8,
     result_cursor: Option<usize>,
+    buffered: Vec<Track>,
+    next_page: Option<String>,
+    loading_more: bool,
+    results_gen: u64,
     radio: Vec<Track>,
     on_radio: bool,
     seek_step: f64,
     volume_step: f64,
     autoplay: bool,
+    popular_first: bool,
     resume: Option<(String, f64)>,
     saved: String,
     save_failed: bool,
@@ -165,11 +178,16 @@ impl App {
             played: HashSet::new(),
             fail_streak: 0,
             result_cursor: None,
+            buffered: Vec::new(),
+            next_page: None,
+            loading_more: false,
+            results_gen: 0,
             radio: Vec::new(),
             on_radio: false,
             seek_step: p.seek_step,
             volume_step: p.volume_step,
             autoplay: p.autoplay,
+            popular_first: cfg.artist.popular_first,
             resume: None,
             saved: String::new(),
             save_failed: false,
@@ -248,6 +266,7 @@ impl App {
 
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
+        self.load_more();
         if self.tick.is_multiple_of(50) {
             match self.save_session(false) {
                 Ok(()) => self.save_failed = false,
@@ -725,18 +744,28 @@ impl App {
     fn search_artist(&mut self, name: String) {
         let busy = format!("Loading songs by \u{201c}{name}\u{201d}");
         let title = format!("Artist: {name}");
+        let popular_first = self.popular_first;
         self.spawn_loader(title, busy, move || {
             let wanted = name.to_lowercase();
-            let tracks = ytmusic::search(&name)?;
-            Ok(tracks
-                .into_iter()
-                .filter(|t| {
-                    t.artist.to_lowercase() == wanted
+            let mut tracks = if popular_first {
+                ytmusic::artist_top_songs(&name).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let found = match ytmusic::search(&name) {
+                Ok(found) => found,
+                Err(e) if tracks.is_empty() => return Err(e),
+                Err(_) => Vec::new(),
+            };
+            let known: HashSet<String> = tracks.iter().map(|t| t.id.clone()).collect();
+            tracks.extend(found.into_iter().filter(|t| {
+                !known.contains(&t.id)
+                    && (t.artist.to_lowercase() == wanted
                         || split_artists(&t.artist)
                             .iter()
-                            .any(|a| a.to_lowercase() == wanted)
-                })
-                .collect())
+                            .any(|a| a.to_lowercase() == wanted))
+            }));
+            Ok(tracks.into())
         });
     }
 
@@ -744,7 +773,7 @@ impl App {
         self.spawn_loader(
             format!("Search: {query}"),
             format!("Searching \u{201c}{query}\u{201d}"),
-            move || ytmusic::search(&query),
+            move || ytmusic::search_page(&query),
         );
     }
 
@@ -752,13 +781,13 @@ impl App {
         self.spawn_loader(
             "Imported playlist".into(),
             "Importing playlist".into(),
-            move || ytmusic::import(&url),
+            move || ytmusic::import(&url).map(Page::from),
         );
     }
 
     fn spawn_loader<F>(&mut self, title: String, busy: String, work: F)
     where
-        F: FnOnce() -> Result<Vec<Track>, String> + Send + 'static,
+        F: FnOnce() -> Result<Page, String> + Send + 'static,
     {
         self.search_id += 1;
         let id = self.search_id;
@@ -778,8 +807,16 @@ impl App {
                 }
                 self.busy = None;
                 match result {
-                    Ok(tracks) if tracks.is_empty() => self.info("No results found."),
-                    Ok(tracks) => {
+                    Ok(page) if page.tracks.is_empty() => self.info("No results found."),
+                    Ok(page) => {
+                        let mut tracks = page.tracks;
+                        self.buffered = match page.next {
+                            Some(_) if tracks.len() > FIRST_PAGE => tracks.split_off(FIRST_PAGE),
+                            _ => Vec::new(),
+                        };
+                        self.next_page = page.next;
+                        self.loading_more = false;
+                        self.results_gen += 1;
                         let n = tracks.len();
                         self.results = tracks;
                         self.results_title = title;
@@ -790,12 +827,70 @@ impl App {
                     Err(e) => self.error(e),
                 }
             }
+            AppEvent::More { generation, result } => {
+                if generation != self.results_gen {
+                    return;
+                }
+                self.loading_more = false;
+                match result {
+                    Ok(page) => {
+                        let known: HashSet<&str> = self
+                            .results
+                            .iter()
+                            .chain(&self.buffered)
+                            .map(|t| t.id.as_str())
+                            .collect();
+                        let fresh: Vec<Track> = page
+                            .tracks
+                            .into_iter()
+                            .filter(|t| !known.contains(t.id.as_str()))
+                            .collect();
+                        self.buffered.extend(fresh);
+                        self.next_page = page.next;
+                        self.reveal_buffered();
+                    }
+                    Err(e) => {
+                        self.next_page = None;
+                        self.error(format!("Could not load more results: {e}"));
+                    }
+                }
+            }
             AppEvent::Player(generation, pe) => {
                 if generation == self.player_gen {
                     self.on_player(pe);
                 }
             }
         }
+    }
+
+    fn reveal_buffered(&mut self) {
+        let n = NEXT_PAGE.min(self.buffered.len());
+        self.results.extend(self.buffered.drain(..n));
+    }
+
+    fn load_more(&mut self) {
+        if self.view != View::Results
+            || self.results.is_empty()
+            || self.selected() + LOAD_AHEAD < self.results.len()
+        {
+            return;
+        }
+        if !self.buffered.is_empty() {
+            return self.reveal_buffered();
+        }
+        let Some(token) = self.next_page.clone() else {
+            return;
+        };
+        if self.loading_more {
+            return;
+        }
+        self.loading_more = true;
+        let generation = self.results_gen;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = ytmusic::search_more(&token);
+            let _ = tx.send(AppEvent::More { generation, result });
+        });
     }
 
     fn ensure_player(&mut self) -> Result<&mut Player> {
@@ -1535,6 +1630,33 @@ mod tests {
         assert!(app.artist_opts.is_empty());
     }
 
+    fn check_paging(app: &mut App) {
+        let tracks: Vec<Track> = (0..25)
+            .map(|i| track(&format!("{i:011}"), &format!("Song {i}")))
+            .collect();
+        let page = Page {
+            tracks,
+            next: Some("token".into()),
+        };
+        app.search_id = 7;
+        app.on_event(AppEvent::Results {
+            id: 7,
+            title: "Search: x".into(),
+            result: Ok(page),
+        });
+        assert_eq!((app.results.len(), app.buffered.len()), (20, 5));
+
+        app.on_tick();
+        assert_eq!(app.results.len(), 20);
+        app.states[View::Results.idx()].select(Some(18));
+        app.load_more();
+        assert_eq!((app.results.len(), app.buffered.len()), (25, 0));
+
+        app.next_page = None;
+        app.load_more();
+        assert_eq!(app.results.len(), 25);
+    }
+
     #[test]
     fn playlist_drill_in() {
         let dir = std::env::temp_dir().join(format!("drift-test-{}", std::process::id()));
@@ -1624,6 +1746,7 @@ mod tests {
         assert_eq!(app.store.playlists.len(), 1);
 
         check_artist_popup(&mut app);
+        check_paging(&mut app);
 
         app.run_command("remove");
         assert_eq!(app.queue.len(), 1);

@@ -51,11 +51,11 @@ fn missing_dependencies(verbose: bool) -> Vec<String> {
     for (tool, hint) in [
         (
             "mpv",
-            "sudo apt install mpv | brew install mpv | sudo pacman -S mpv",
+            "sudo apt install mpv | brew install mpv | sudo pacman -S mpv | winget install mpv",
         ),
         (
             "yt-dlp",
-            "pipx install yt-dlp | brew install yt-dlp | sudo pacman -S yt-dlp",
+            "pipx install yt-dlp | brew install yt-dlp | sudo pacman -S yt-dlp | winget install yt-dlp",
         ),
     ] {
         match tool_version(tool) {
