@@ -37,38 +37,46 @@ Stream your favourite music from YouTube Music — all in one client, in your te
 
 ## Installation
 
-### Dependencies
+### Arch Linux (AUR)
+
+```bash
+yay -S driftmusic-git
+```
+
+Any AUR helper works (`paru -S driftmusic-git`), or build it by hand:
+
+```bash
+git clone https://aur.archlinux.org/driftmusic-git.git
+cd driftmusic-git
+makepkg -si
+```
+
+`mpv` and `yt-dlp` are installed automatically.
+
+### Other distros
+
+Install the dependencies:
 
 - [mpv](https://mpv.io/) — audio playback
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — YouTube stream extraction
 - [Rust](https://rustup.rs/) (build only)
 
-Install them with your package manager, e.g. on Arch:
-```
-sudo pacman -S mpv yt-dlp
-```
-
-### Build & install
+Then build from source:
 
 ```bash
 git clone https://github.com/socatlolmeow/drift.git
 cd drift
 cargo build --release
-```
-
-Then copy the binary to somewhere on your `$PATH`:
-```bash
 sudo cp target/release/drift /usr/local/bin/
 ```
 
 Or install directly with cargo:
+
 ```bash
 cargo install --path .
 ```
 
 This installs `drift` to `~/.cargo/bin/`, which is on your `$PATH` if you installed Rust via [rustup](https://rustup.rs/).
-
----
 
 ## Star History
 
