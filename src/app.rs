@@ -215,7 +215,7 @@ impl App {
         }
         match warning {
             Some(w) => app.error(w),
-            None => app.info("Welcome! Press / to search, ? for help."),
+            None => app.info("Hello! Press / to search, and ? for help"),
         }
         app
     }
@@ -1346,7 +1346,7 @@ impl App {
             self.stop_playback();
         }
         self.states[View::Queue.idx()].select(None);
-        self.info("Queue cleared");
+        self.info("Cleared queue");
     }
 
     fn remove_from_queue(&mut self, i: usize) {

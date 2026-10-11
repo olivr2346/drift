@@ -60,7 +60,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     .areas(area);
 
     f.render_widget(
-        Paragraph::new(" ♪ Drift").style(Style::new().fg(ACCENT).bold()),
+        Paragraph::new(" Drift").style(Style::new().fg(ACCENT).bold()),
         name,
     );
 
