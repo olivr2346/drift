@@ -8,7 +8,7 @@ use ratatui::widgets::TableState;
 
 use crate::command::{self, Amount, Command, COMMAND_NAMES};
 use crate::config::{self, Config};
-use crate::model::{split_artists, RepeatMode, Track};
+use crate::model::{fmt_time, split_artists, RepeatMode, Track};
 use crate::player::{Player, PlayerEvent};
 use crate::session::Session;
 use crate::store::Store;
@@ -58,6 +58,8 @@ pub enum Mode {
     ArtistPick,
     ConfirmDelete,
     Help,
+    Menu,
+    Info,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +74,52 @@ pub enum PlayState {
 pub enum Level {
     Info,
     Error,
+}
+
+/// Hotkey value meaning "this menu entry has no hotkey".
+pub const NO_KEY: char = '\0';
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum MenuAction {
+    Play,
+    PlayNext,
+    Queue,
+    Artist,
+    PlaylistMenu,
+    PickPlaylist(String),
+    NewPlaylist,
+    Remove,
+    Info,
+    QueueAll,
+    PlayAll,
+    ClearQueue,
+    SaveQueue,
+    OpenPlaylist,
+    AppendPlaylist,
+    DeletePlaylist,
+}
+
+#[derive(Clone)]
+pub struct MenuItem {
+    pub key: char,
+    pub label: String,
+    pub detail: String,
+    pub action: MenuAction,
+}
+
+/// Ctrl held without Alt. Windows reports AltGr (needed for `@ \\ { [ ~` and
+/// friends on many layouts) as Ctrl+Alt, which must still count as typing.
+fn is_ctrl(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn menu_item(key: char, label: &str, action: MenuAction) -> MenuItem {
+    MenuItem {
+        key,
+        label: label.to_string(),
+        detail: String::new(),
+        action,
+    }
 }
 
 pub struct Status {
@@ -93,7 +141,16 @@ pub struct App {
     pub pl_state: TableState,
 
     pub cmd_buf: String,
+    pub cmd_search: bool,
+    pub menu_items: Vec<MenuItem>,
+    pub menu_sel: usize,
+    pub menu_title: String,
+    pub menu_sub: bool,
+    pub menu_track: Option<Track>,
+    pub cmd_sel: usize,
+    cmd_cycle: Option<String>,
     pub artist_opts: Vec<String>,
+    pub info_track: Option<Track>,
     pub artist_sel: usize,
     pub pending_delete: Option<String>,
     pub help_scroll: usize,
@@ -161,7 +218,16 @@ impl App {
             open: None,
             pl_state: TableState::default(),
             cmd_buf: String::new(),
+            cmd_search: false,
+            menu_items: Vec::new(),
+            menu_sel: 0,
+            menu_title: String::new(),
+            menu_sub: false,
+            menu_track: None,
+            cmd_sel: 0,
+            cmd_cycle: None,
             artist_opts: Vec::new(),
+            info_track: None,
             artist_sel: 0,
             pending_delete: None,
             help_scroll: 0,
@@ -370,18 +436,23 @@ impl App {
             Mode::Command => self.key_command(key),
             Mode::ArtistPick => self.key_artist_pick(key),
             Mode::ConfirmDelete => self.key_confirm_delete(key),
+            Mode::Menu => self.key_menu(key),
+            Mode::Info => self.key_info(key),
             Mode::Normal => self.key_normal(key),
         }
     }
 
     fn key_normal(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = is_ctrl(&key);
 
         if let Some(p) = self.pending.take() {
             let n = self.count.take();
             if let KeyCode::Char(c) = key.code {
                 match (p, c) {
                     ('g', 'g') => self.set_selected(n.map_or(0, |n| n.saturating_sub(1))),
+                    ('g', 'e') => {
+                        self.set_selected(n.map_or(usize::MAX, |n| n.saturating_sub(1)))
+                    }
                     ('g', 'r') => self.set_view(View::Results),
                     ('g', 'q') => self.set_view(View::Queue),
                     ('g', 'p') => self.set_view(View::Playlists),
@@ -433,7 +504,7 @@ impl App {
                 self.pending = Some('g');
                 self.count = n;
             }
-            KeyCode::Char('G') => self.set_selected(n.map_or(usize::MAX, |n| n.saturating_sub(1))),
+            KeyCode::Char('G') | KeyCode::Menu => self.open_menu(),
             KeyCode::Char('d') => {
                 if matches!(self.view, View::Queue | View::Playlists) {
                     self.pending = Some('d');
@@ -470,11 +541,13 @@ impl App {
             KeyCode::Char('r') => self.cycle_repeat(),
 
             KeyCode::Char('/') => {
-                self.cmd_buf = "search ".into();
+                self.cmd_buf.clear();
+                self.cmd_search = true;
                 self.enter_command_mode();
             }
             KeyCode::Char(':') => {
                 self.cmd_buf.clear();
+                self.cmd_search = false;
                 self.enter_command_mode();
             }
             KeyCode::Char('?') => self.open_help(),
@@ -482,6 +555,195 @@ impl App {
             KeyCode::Esc => self.status = None,
             _ => {}
         }
+    }
+
+    /// The song under the cursor (no fallback to the playing song).
+    fn selected_track(&self) -> Option<Track> {
+        let sel = self.selected();
+        match self.view {
+            View::Results => self.results.get(sel).cloned(),
+            View::Queue => self.queue.get(sel).cloned(),
+            View::Playlists if self.in_playlist() => self
+                .open
+                .as_ref()
+                .and_then(|n| self.store.playlists.get(n))
+                .and_then(|t| t.get(sel))
+                .cloned(),
+            View::Playlists => None,
+        }
+    }
+
+    /// `G`: open the context menu for whatever is highlighted.
+    fn open_menu(&mut self) {
+        let mut items: Vec<MenuItem> = Vec::new();
+        if self.view == View::Playlists && !self.in_playlist() {
+            let Some(name) = self.playlist_name(self.selected()) else {
+                return self.error("No playlist selected");
+            };
+            let n = self.store.playlists.get(&name).map_or(0, Vec::len);
+            items.push(menu_item('o', "Open", MenuAction::OpenPlaylist));
+            items.push(menu_item('p', "Play", MenuAction::Play));
+            items.push(menu_item('a', "Append to queue", MenuAction::AppendPlaylist));
+            items.push(menu_item('x', "Delete playlist…", MenuAction::DeletePlaylist));
+            self.menu_title = format!("{name} ({n})");
+            self.menu_track = None;
+        } else {
+            let Some(track) = self.selected_track() else {
+                return self.error("No song selected");
+            };
+            let in_queue = self.view == View::Queue;
+            items.push(menu_item('p', "Play now", MenuAction::Play));
+            if !in_queue {
+                items.push(menu_item('n', "Play next", MenuAction::PlayNext));
+                items.push(menu_item('a', "Add to queue", MenuAction::Queue));
+            }
+            items.push(menu_item('g', "Show artist", MenuAction::Artist));
+            items.push(menu_item('l', "Add to playlist…", MenuAction::PlaylistMenu));
+            if in_queue {
+                items.push(menu_item('x', "Remove from queue", MenuAction::Remove));
+            } else if self.in_playlist() {
+                items.push(menu_item('x', "Remove from playlist", MenuAction::Remove));
+            }
+            items.push(menu_item('i', "Song info", MenuAction::Info));
+            if self.view == View::Results {
+                items.push(menu_item('Q', "Queue all results", MenuAction::QueueAll));
+                items.push(menu_item('P', "Play all results", MenuAction::PlayAll));
+            }
+            if in_queue {
+                items.push(menu_item('c', "Clear queue", MenuAction::ClearQueue));
+                items.push(menu_item('S', "Save queue as playlist…", MenuAction::SaveQueue));
+            }
+            self.menu_title = track.title.clone();
+            self.menu_track = Some(track);
+        }
+        self.menu_items = items;
+        self.menu_sel = 0;
+        self.menu_sub = false;
+        self.mode = Mode::Menu;
+    }
+
+    fn open_playlist_menu(&mut self) {
+        let track = self.menu_track.clone();
+        let mut items: Vec<MenuItem> = self
+            .store
+            .playlists
+            .iter()
+            .enumerate()
+            .map(|(i, (name, list))| {
+                let has = track
+                    .as_ref()
+                    .is_some_and(|t| list.iter().any(|x| x.id == t.id));
+                MenuItem {
+                    key: if i < 9 {
+                        char::from_digit(i as u32 + 1, 10).unwrap_or(NO_KEY)
+                    } else {
+                        NO_KEY
+                    },
+                    label: name.clone(),
+                    detail: if has {
+                        "✓ already in it".to_string()
+                    } else {
+                        format!("{} songs", list.len())
+                    },
+                    action: MenuAction::PickPlaylist(name.clone()),
+                }
+            })
+            .collect();
+        items.push(menu_item('+', "New playlist…", MenuAction::NewPlaylist));
+        self.menu_items = items;
+        self.menu_title = "Add to playlist".into();
+        self.menu_sel = 0;
+        self.menu_sub = true;
+    }
+
+    fn close_menu(&mut self) {
+        self.mode = Mode::Normal;
+        self.menu_items.clear();
+        self.menu_sel = 0;
+        self.menu_sub = false;
+        self.menu_track = None;
+    }
+
+    fn key_menu(&mut self, key: KeyEvent) {
+        let ctrl = is_ctrl(&key);
+        let len = self.menu_items.len();
+        if len == 0 {
+            return self.close_menu();
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('G') | KeyCode::Menu => {
+                if self.menu_sub {
+                    self.open_menu();
+                } else {
+                    self.close_menu();
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.menu_sel = (self.menu_sel + 1) % len,
+            KeyCode::Char('k') | KeyCode::Up => self.menu_sel = (self.menu_sel + len - 1) % len,
+            KeyCode::Char('n') if ctrl => self.menu_sel = (self.menu_sel + 1) % len,
+            KeyCode::Char('p') if ctrl => self.menu_sel = (self.menu_sel + len - 1) % len,
+            KeyCode::Home => self.menu_sel = 0,
+            KeyCode::End => self.menu_sel = len - 1,
+            KeyCode::Enter => self.run_menu(self.menu_sel),
+            KeyCode::Char(c) if !ctrl && c != NO_KEY => {
+                if let Some(i) = self.menu_items.iter().position(|it| it.key == c) {
+                    self.menu_sel = i;
+                    self.run_menu(i);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_menu(&mut self, i: usize) {
+        let Some(item) = self.menu_items.get(i).cloned() else {
+            return;
+        };
+        if item.action == MenuAction::PlaylistMenu {
+            return self.open_playlist_menu();
+        }
+        let track = self.menu_track.clone();
+        self.close_menu();
+        match item.action {
+            MenuAction::Play => self.activate(),
+            MenuAction::PlayNext => {
+                if let Some(t) = track {
+                    self.play_next(t);
+                }
+            }
+            MenuAction::Queue | MenuAction::AppendPlaylist => self.add_selected(),
+            MenuAction::Artist => self.go_to_artist(),
+            MenuAction::PlaylistMenu => {}
+            MenuAction::PickPlaylist(name) => self.add_to_playlist(&name),
+            MenuAction::NewPlaylist => self.prefill_command("addto "),
+            MenuAction::Remove | MenuAction::DeletePlaylist => self.delete_selected(),
+            MenuAction::Info => {
+                if let Some(t) = track {
+                    self.info_track = Some(t);
+                    self.mode = Mode::Info;
+                }
+            }
+            MenuAction::QueueAll => self.add_all_results(),
+            MenuAction::PlayAll => self.play_all_results(),
+            MenuAction::ClearQueue => self.clear_queue(),
+            MenuAction::SaveQueue => self.prefill_command("save "),
+            MenuAction::OpenPlaylist => self.open_selected_playlist(),
+        }
+    }
+
+    /// Open the `:` popup with some text already typed (e.g. `save `).
+    fn prefill_command(&mut self, text: &str) {
+        self.cmd_buf = text.to_string();
+        self.cmd_search = false;
+        self.enter_command_mode();
+    }
+
+    fn play_next(&mut self, t: Track) {
+        let label = t.label();
+        let len = self.queue.len();
+        let at = self.current.map_or(0, |c| (c + 1).min(len));
+        self.queue.insert(at, t);
+        self.info(format!("Playing next: {label}"));
     }
 
     fn key_confirm_delete(&mut self, key: KeyEvent) {
@@ -497,8 +759,13 @@ impl App {
         self.mode = Mode::Help;
     }
 
+    fn key_info(&mut self, _key: KeyEvent) {
+        self.mode = Mode::Normal;
+        self.info_track = None;
+    }
+
     fn key_help(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = is_ctrl(&key);
         let s = self.help_scroll;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
@@ -519,10 +786,45 @@ impl App {
     fn enter_command_mode(&mut self) {
         self.mode = Mode::Command;
         self.hist_pos = None;
+        self.cmd_cycle = None;
+        self.cmd_sel = 0;
+    }
+
+    /// Commands matching what is typed so far (only while typing the command name).
+    pub fn command_matches(&self) -> Vec<&'static str> {
+        if self.cmd_search || self.cmd_buf.contains(' ') {
+            return Vec::new();
+        }
+        let prefix = self.cmd_cycle.as_deref().unwrap_or(self.cmd_buf.as_str());
+        COMMAND_NAMES
+            .iter()
+            .copied()
+            .filter(|c| c.starts_with(prefix))
+            .collect()
+    }
+
+    /// True while Tab / Shift-Tab is stepping through the suggestion list.
+    pub fn cycling(&self) -> bool {
+        self.cmd_cycle.is_some()
+    }
+
+    /// Most recent searches, newest first (shown in the `/` popup).
+    pub fn recent_searches(&self, n: usize) -> Vec<&str> {
+        self.history
+            .iter()
+            .rev()
+            .filter_map(|h| h.strip_prefix("search "))
+            .take(n)
+            .collect()
     }
 
     fn key_command(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = is_ctrl(&key);
+        let cycling = matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            || (ctrl && matches!(key.code, KeyCode::Char('n') | KeyCode::Char('p')));
+        if !cycling {
+            self.cmd_cycle = None;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
@@ -532,12 +834,18 @@ impl App {
                 let line = std::mem::take(&mut self.cmd_buf);
                 self.mode = Mode::Normal;
                 let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    if self.history.last().map(String::as_str) != Some(trimmed) {
-                        self.history.push(trimmed.to_string());
-                    }
-                    self.run_command(trimmed);
+                if trimmed.is_empty() {
+                    return;
                 }
+                let full = if self.cmd_search {
+                    format!("search {trimmed}")
+                } else {
+                    trimmed.to_string()
+                };
+                if self.history.last() != Some(&full) {
+                    self.history.push(full.clone());
+                }
+                self.run_command(&full);
             }
             KeyCode::Backspace => {
                 if self.cmd_buf.is_empty() {
@@ -554,17 +862,30 @@ impl App {
             }
             KeyCode::Up => self.history_step(-1),
             KeyCode::Down => self.history_step(1),
-            KeyCode::Tab => self.complete(),
+            KeyCode::Tab => self.complete(1),
+            KeyCode::BackTab => self.complete(-1),
+            KeyCode::Char('n') if ctrl => self.complete(1),
+            KeyCode::Char('p') if ctrl => self.complete(-1),
             KeyCode::Char(c) if !ctrl => self.cmd_buf.push(c),
             _ => {}
         }
     }
 
     fn history_step(&mut self, dir: isize) {
-        if self.history.is_empty() {
+        let search = self.cmd_search;
+        let entries: Vec<String> = self
+            .history
+            .iter()
+            .filter_map(|h| match h.strip_prefix("search ") {
+                Some(q) if search => Some(q.to_string()),
+                _ if search => None,
+                _ => Some(h.clone()),
+            })
+            .collect();
+        if entries.is_empty() {
             return;
         }
-        let len = self.history.len() as isize;
+        let len = entries.len() as isize;
         let pos = match (self.hist_pos, dir) {
             (None, -1) => len - 1,
             (None, _) => return,
@@ -576,25 +897,36 @@ impl App {
         } else {
             let pos = pos.max(0) as usize;
             self.hist_pos = Some(pos);
-            self.cmd_buf = self.history[pos].clone();
+            self.cmd_buf = entries[pos].clone();
         }
     }
 
-    fn complete(&mut self) {
-        if self.cmd_buf.contains(' ') {
+    /// Tab / Shift-Tab: cycle through the commands matching the typed prefix.
+    fn complete(&mut self, dir: isize) {
+        if self.cmd_search || self.cmd_buf.contains(' ') {
             return;
         }
-        let matches: Vec<&&str> = COMMAND_NAMES
-            .iter()
-            .filter(|c| c.starts_with(self.cmd_buf.as_str()))
-            .collect();
-        match matches.len() {
-            0 => {}
-            1 => self.cmd_buf = format!("{} ", matches[0]),
-            _ => {
-                let list = matches.iter().map(|s| **s).collect::<Vec<_>>().join(" ");
-                self.info(list);
-            }
+        if self.cmd_cycle.is_none() {
+            self.cmd_cycle = Some(self.cmd_buf.clone());
+            self.cmd_sel = if dir < 0 { usize::MAX } else { 0 };
+        } else {
+            let n = self.command_matches().len().max(1) as isize;
+            self.cmd_sel = (self.cmd_sel as isize + dir).rem_euclid(n) as usize;
+        }
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            self.cmd_cycle = None;
+            return;
+        }
+        if self.cmd_sel >= matches.len() {
+            self.cmd_sel = matches.len() - 1;
+        }
+        let pick = matches[self.cmd_sel];
+        if matches.len() == 1 {
+            self.cmd_buf = format!("{pick} ");
+            self.cmd_cycle = None;
+        } else {
+            self.cmd_buf = pick.to_string();
         }
     }
 
@@ -1661,8 +1993,8 @@ mod tests {
     fn playlist_drill_in() {
         let dir = std::env::temp_dir().join(format!("drift-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-        std::env::set_var("XDG_STATE_HOME", &dir);
+        std::env::set_var("DRIFT_CONFIG_DIR", &dir);
+        std::env::set_var("DRIFT_STATE_DIR", &dir);
 
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(tx);

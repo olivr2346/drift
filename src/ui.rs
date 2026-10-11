@@ -1,10 +1,10 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Tabs};
 use ratatui::Frame;
 
-use crate::app::{App, Level, Mode, PlayState, View};
+use crate::app::{App, Level, MenuAction, Mode, PlayState, View, NO_KEY};
 use crate::model::{fmt_time, Track};
 
 const ACCENT: Color = Color::Cyan;
@@ -27,11 +27,10 @@ fn dim() -> Style {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    let [top, body, playing, bottom] = Layout::vertical([
+    let [top, body, playing] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(4),
-        Constraint::Length(1),
     ])
     .areas(area);
 
@@ -42,13 +41,41 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Playlists => draw_playlists(f, app, body),
     }
     draw_now_playing(f, app, playing);
-    draw_cmdline(f, app, bottom);
+    if app.mode == Mode::Command {
+        draw_palette(f, app, area);
+    }
+    if app.mode == Mode::ConfirmDelete {
+        draw_confirm(f, app, area);
+    }
+    if app.mode == Mode::Menu {
+        draw_menu(f, app, area);
+    }
     if app.mode == Mode::Help {
         draw_help(f, app, area);
     }
     if app.mode == Mode::ArtistPick {
         draw_artist_picker(f, app, area);
     }
+    if app.mode == Mode::Info {
+        draw_info(f, app, area);
+    }
+    draw_toast(f, app, body);
+}
+
+fn hints(items: &[(&str, &str)], width: u16) -> Option<Line<'static>> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut len = 2usize;
+    for (i, (key, label)) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ", dim()));
+            len += 2;
+        }
+        spans.push(Span::styled(key.to_string(), Style::new().fg(Color::Yellow)));
+        spans.push(Span::styled(format!(" {label}"), dim()));
+        len += key.chars().count() + 1 + label.chars().count();
+    }
+    spans.push(Span::raw(" "));
+    (len + 4 <= width as usize).then(|| Line::from(spans).right_aligned())
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
@@ -181,9 +208,19 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, view: View) {
         View::Queue => (&app.queue, " Queue ".to_string()),
         _ => (&app.results, format!(" {} ", app.results_title)),
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(format!("{title}({}) ", tracks.len()))
         .border_style(Style::new().fg(ACCENT));
+    if !tracks.is_empty() {
+        let keys: &[(&str, &str)] = if view == View::Queue {
+            &[("⏎", "play"), ("x", "remove"), ("J/K", "move"), ("G", "menu"), ("?", "help")]
+        } else {
+            &[("⏎", "play"), ("a", "queue"), ("G", "menu"), ("/", "search"), ("?", "help")]
+        };
+        if let Some(h) = hints(keys, area.width) {
+            block = block.title_bottom(h);
+        }
+    }
 
     if tracks.is_empty() {
         let hint: &[&str] = if view == View::Queue {
@@ -214,9 +251,15 @@ fn draw_open_playlist(f: &mut Frame, app: &mut App, area: Rect, name: &str) {
     let Some(tracks) = app.store.playlists.get(name) else {
         return;
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(format!(" {name} ({}) ", tracks.len()))
         .border_style(Style::new().fg(ACCENT));
+    if !tracks.is_empty() {
+        let keys = [("⏎", "play"), ("a", "queue"), ("x", "remove"), ("G", "menu"), ("←", "back")];
+        if let Some(h) = hints(&keys, area.width) {
+            block = block.title_bottom(h);
+        }
+    }
     if tracks.is_empty() {
         return empty_hint(
             f,
@@ -244,9 +287,14 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(area);
 
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(format!(" Playlists ({}) ", app.store.playlists.len()))
         .border_style(Style::new().fg(ACCENT));
+    if !app.store.playlists.is_empty() {
+        if let Some(h) = hints(&[("⏎", "load"), ("→", "open"), ("G", "menu")], left.width) {
+            block = block.title_bottom(h);
+        }
+    }
 
     if app.store.playlists.is_empty() {
         empty_hint(
@@ -306,54 +354,127 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+const BARS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+fn gradient(_t: f64) -> Color {
+    ACCENT
+}
+
+fn equalizer(app: &App, n: usize) -> Vec<Span<'static>> {
+    let t = app.tick as f64;
+    (0..n)
+        .map(|i| {
+            let x = i as f64;
+            let level = match app.play_state {
+                PlayState::Playing => {
+                    let v = ((t * 0.45 + x * 1.3).sin() + (t * 0.23 + x * 2.1).sin()) / 4.0 + 0.5;
+                    (v.clamp(0.0, 1.0) * 7.0).round() as usize
+                }
+                _ => 0,
+            };
+            let color = if app.play_state == PlayState::Playing {
+                gradient(x / n as f64)
+            } else {
+                Color::DarkGray
+            };
+            Span::styled(BARS[level], Style::new().fg(color))
+        })
+        .collect()
+}
+
 fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::bordered()
-        .title(" Now Playing ")
-        .border_style(Style::new().fg(ACCENT));
+    let active = app.play_state != PlayState::Stopped;
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if active { ACCENT } else { Color::DarkGray }))
+        .title(Line::from(vec![
+            Span::styled(" ♪ ", Style::new().fg(ACCENT).bold()),
+            Span::styled("Now Playing ", Style::new().fg(ACCENT).bold()),
+        ]));
+
+    let mut pending = String::new();
+    if let Some(c) = app.count {
+        pending.push_str(&c.to_string());
+    }
+    if let Some(p) = app.pending {
+        pending.push(p);
+    }
+    if !pending.is_empty() {
+        block = block.title_bottom(
+            Line::styled(format!(" {pending} "), Style::new().fg(Color::Yellow).bold())
+                .right_aligned(),
+        );
+    }
+
     let inner = block.inner(area);
     f.render_widget(block, area);
     let [l1, l2] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
 
-    let mut flags = vec![format!("vol {}%", app.volume)];
-    if app.shuffle {
-        flags.push("shuffle".into());
+    let on = Style::new().fg(ACCENT).bold();
+    let vol_cells = 5usize;
+    let vol_fill = ((app.volume as usize * vol_cells) + 50) / 100;
+    let mut flags = vec![
+        Span::styled("⇄", if app.shuffle { on } else { dim() }),
+        Span::raw("  "),
+        Span::styled(
+            match app.repeat {
+                crate::model::RepeatMode::Off => "↻".to_string(),
+                m => format!("↻ {}", m.label()),
+            },
+            if app.repeat != crate::model::RepeatMode::Off {
+                on
+            } else {
+                dim()
+            },
+        ),
+        Span::raw("   "),
+        Span::styled("vol ", dim()),
+    ];
+    for i in 0..vol_cells {
+        flags.push(if i < vol_fill.min(vol_cells) {
+            Span::styled("━", Style::new().fg(gradient(i as f64 / vol_cells as f64)))
+        } else {
+            Span::styled("─", dim())
+        });
     }
-    if app.repeat != crate::model::RepeatMode::Off {
-        flags.push(format!("repeat:{}", app.repeat.label()));
-    }
-    let flags = flags.join(" · ");
-    let flags_w = flags.chars().count() as u16 + 1;
+    flags.push(Span::styled(format!(" {:>3}%", app.volume), Style::new().fg(Color::Gray)));
+    flags.push(Span::raw(" "));
+    let flags_w: usize = flags.iter().map(|s| s.content.chars().count()).sum();
     let [title_area, flags_area] =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(flags_w)]).areas(l1);
-    f.render_widget(
-        Paragraph::new(flags)
-            .style(dim())
-            .alignment(Alignment::Right),
-        flags_area,
-    );
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(flags_w as u16)]).areas(l1);
+    f.render_widget(Paragraph::new(Line::from(flags)), flags_area);
 
-    let icon = match app.play_state {
-        PlayState::Playing => "▶".to_string(),
-        PlayState::Paused => "⏸".to_string(),
-        PlayState::Loading => SPINNER[app.tick % SPINNER.len()].to_string(),
-        PlayState::Stopped => "■".to_string(),
-    };
-    let line = match (app.now_track(), app.play_state) {
-        (Some(t), s) if s != PlayState::Stopped => Line::from(vec![
-            Span::styled(format!("{icon} "), Style::new().fg(Color::Green)),
-            Span::styled(t.title.clone(), Style::new().bold()),
-            Span::styled(format!("  {}", t.artist), Style::new().fg(Color::Gray)),
-        ]),
-        (Some(t), _) => Line::from(vec![
-            Span::styled(format!("{icon} "), dim()),
-            Span::styled(format!("Last played: {} — {}", t.title, t.artist), dim()),
-        ]),
-        _ => Line::from(vec![
-            Span::styled(format!("{icon} "), dim()),
-            Span::styled("Nothing playing", dim()),
-        ]),
-    };
-    f.render_widget(Paragraph::new(line), title_area);
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    match app.play_state {
+        PlayState::Loading => spans.push(Span::styled(
+            format!("{}      ", SPINNER[app.tick % SPINNER.len()]),
+            Style::new().fg(Color::Yellow),
+        )),
+        PlayState::Playing => {
+            spans.extend(equalizer(app, 6));
+            spans.push(Span::raw(" "));
+        }
+        PlayState::Paused => {
+            spans.push(Span::styled("⏸ ", Style::new().fg(Color::Yellow)));
+            spans.push(Span::raw("     "));
+        }
+        _ => {
+        }
+    }
+    spans.push(Span::raw(" "));
+    match (app.now_track(), active) {
+        (Some(t), true) => {
+            spans.push(Span::styled(t.title.clone(), Style::new().fg(Color::White).bold()));
+            spans.push(Span::styled("  ·  ", dim()));
+            spans.push(Span::styled(t.artist.clone(), Style::new().fg(ACCENT)));
+        }
+        (Some(t), false) => spans.push(Span::styled(
+            format!("Last played: {} — {}", t.title, t.artist),
+            dim(),
+        )),
+        _ => spans.push(Span::styled("Nothing playing  ·  press / to search", dim())),
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), title_area);
 
     let left = format!(" {} ", fmt_time(app.position));
     let right = format!(
@@ -370,65 +491,389 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
     } else {
         0.0
     };
-    let filled = (ratio * bar_w as f64).round() as usize;
-    let line = Line::from(vec![
-        Span::raw(left),
-        Span::styled("━".repeat(filled), Style::new().fg(ACCENT)),
-        Span::styled("─".repeat(bar_w.saturating_sub(filled)), dim()),
-        Span::raw(right),
-    ]);
-    f.render_widget(Paragraph::new(line), l2);
+    let head = ((ratio * bar_w as f64) as usize).min(bar_w.saturating_sub(1));
+    let mut line = vec![Span::styled(left, Style::new().fg(Color::Gray))];
+    for i in 0..bar_w {
+        line.push(if !active || app.duration <= 0.0 {
+            Span::styled("─", dim())
+        } else if i < head {
+            Span::styled("━", Style::new().fg(gradient(i as f64 / bar_w.max(1) as f64)))
+        } else if i == head {
+            Span::styled("●", Style::new().fg(Color::White).bold())
+        } else {
+            Span::styled("─", dim())
+        });
+    }
+    line.push(Span::styled(right, Style::new().fg(Color::Gray)));
+    f.render_widget(Paragraph::new(Line::from(line)), l2);
 }
 
-fn draw_cmdline(f: &mut Frame, app: &App, area: Rect) {
-    if app.mode == Mode::ConfirmDelete {
-        let name = app.pending_delete.as_deref().unwrap_or_default();
-        f.render_widget(
-            Paragraph::new(format!(" Delete playlist \u{201c}{name}\u{201d}? (y/N)"))
-                .style(Style::new().fg(Color::Yellow).bold()),
-            area,
-        );
+fn draw_toast(f: &mut Frame, app: &App, body: Rect) {
+    let Some(s) = app.visible_status() else {
         return;
-    }
-
-    if app.mode == Mode::Command {
-        let text = format!(":{}", app.cmd_buf);
-        let col = text
-            .chars()
-            .count()
-            .min(area.width.saturating_sub(1) as usize) as u16;
-        f.render_widget(Paragraph::new(text), area);
-        f.set_cursor_position((area.x + col, area.y));
-        return;
-    }
-
-    let line = match app.visible_status() {
-        Some(s) => {
-            let style = match s.level {
-                Level::Error => Style::new().fg(Color::Red).bold(),
-                Level::Info => Style::new().fg(Color::Green),
-            };
-            Line::styled(format!(" {}", s.text), style)
-        }
-        None => Line::default(),
     };
-    f.render_widget(Paragraph::new(line), area);
+    if body.width < 16 || body.height < 5 {
+        return;
+    }
+    let (icon, color) = match s.level {
+        Level::Error => ("✖", Color::Red),
+        Level::Info => ("●", Color::Green),
+    };
+    let max_text = (body.width as usize).saturating_sub(8).min(70);
+    let mut text: String = s.text.lines().next().unwrap_or("").to_string();
+    if text.chars().count() > max_text {
+        text = text.chars().take(max_text.saturating_sub(1)).collect::<String>() + "…";
+    }
+    let w = (text.chars().count() as u16 + 6).min(body.width);
+    let rect = Rect::new(body.right().saturating_sub(w + 1).max(body.x), body.bottom().saturating_sub(4), w, 3);
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {icon} "), Style::new().fg(color).bold()),
+            Span::styled(text, Style::new().fg(Color::White)),
+        ]))
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(color)),
+        ),
+        rect,
+    );
+}
 
-    let mut pending = String::new();
-    if let Some(c) = app.count {
-        pending.push_str(&c.to_string());
+fn draw_info(f: &mut Frame, app: &App, area: Rect) {
+    let Some(t) = &app.info_track else {
+        return;
+    };
+    let rows: Vec<(&str, String)> = vec![
+        ("Title", t.title.clone()),
+        ("Artist", t.artist.clone()),
+        ("Album", t.album.clone().unwrap_or_else(|| "—".into())),
+        ("Length", t.duration.map_or("—".into(), |d| fmt_time(d as f64))),
+        ("ID", t.id.clone()),
+    ];
+    let label_w = 8usize;
+    let widest = rows.iter().map(|(_, v)| v.chars().count()).max().unwrap_or(0);
+    let w = ((label_w + widest + 6).max(40) as u16).min(area.width.min(80));
+    let value_w = (w as usize).saturating_sub(label_w + 4).max(1);
+    let mut lines: Vec<Line> = Vec::new();
+    for (k, v) in &rows {
+        let mut parts = wrap_words(v, value_w).into_iter();
+        let first = parts.next().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {k:<label_w$}"), header_style()),
+            Span::styled(first, Style::new().fg(Color::White)),
+        ]));
+        for rest in parts {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(label_w + 1)),
+                Span::styled(rest, Style::new().fg(Color::White)),
+            ]));
+        }
     }
-    if let Some(p) = app.pending {
-        pending.push(p);
+    let popup = popup_rect(area, w, lines.len() as u16 + 2, false);
+    if popup.width < 12 || popup.height < 3 {
+        return;
     }
-    if !pending.is_empty() {
-        f.render_widget(
-            Paragraph::new(format!("{pending} "))
-                .alignment(Alignment::Right)
-                .style(Style::new().fg(Color::Yellow)),
-            area,
-        );
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(ACCENT))
+                .title(Span::styled(" ♪ Song info ", Style::new().fg(ACCENT).bold()))
+                .title_bottom(Line::styled(" any key to close ", dim()).right_aligned()),
+        ),
+        popup,
+    );
+}
+
+fn popup_rect(area: Rect, want_w: u16, want_h: u16, top_third: bool) -> Rect {
+    let w = want_w.min(area.width);
+    let x = area.x + (area.width - w) / 2;
+    let y = if top_third {
+        area.y + area.height / 5
+    } else {
+        area.y + area.height.saturating_sub(want_h) / 2
+    };
+    let h = want_h.min(area.bottom().saturating_sub(y));
+    Rect::new(x, y, w, h)
+}
+
+const CMD_INFO: &[(&str, &str)] = &[
+    ("search", "search YouTube Music"),
+    ("play", "play / resume  ·  play N plays row N"),
+    ("pause", "pause playback"),
+    ("resume", "resume playback"),
+    ("toggle", "toggle pause"),
+    ("stop", "stop playback"),
+    ("next", "skip to the next track"),
+    ("prev", "go back to the previous track"),
+    ("quit", "exit drift"),
+    ("add", "queue the selected result  ·  add N"),
+    ("addall", "queue all results"),
+    ("playall", "play all results"),
+    ("remove", "remove from the queue  ·  remove N"),
+    ("clear", "empty the queue"),
+    ("results", "show the Results tab"),
+    ("queue", "show the Queue tab"),
+    ("playlists", "show the Playlists tab"),
+    ("volume", "set volume  ·  50 | +5 | -5"),
+    ("seek", "seek  ·  90 | 1:30 | +10 | -10"),
+    ("shuffle", "toggle shuffle"),
+    ("repeat", "repeat  ·  off | all | one"),
+    ("save", "save the queue as a playlist"),
+    ("load", "load a playlist into the queue"),
+    ("append", "append a playlist to the queue"),
+    ("delpl", "delete a playlist"),
+    ("addto", "add the selected track to a playlist"),
+    ("import", "import a YouTube / YT Music playlist URL"),
+    ("artist", "songs by the selected artist"),
+    ("help", "show key bindings"),
+];
+
+fn cmd_info(name: &str) -> &'static str {
+    CMD_INFO
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or("", |(_, d)| *d)
+}
+
+fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
+    const MAX_ROWS: usize = 8;
+    let search = app.cmd_search;
+    let matches = app.command_matches();
+    let recent = if search && app.cmd_buf.is_empty() {
+        app.recent_searches(5)
+    } else {
+        Vec::new()
+    };
+    let first_word = app.cmd_buf.split_whitespace().next().unwrap_or("");
+    let typing_args = !search && app.cmd_buf.contains(' ');
+
+    let list_rows = if search {
+        recent.len().max(1)
+    } else if typing_args {
+        1
+    } else {
+        matches.len().clamp(1, MAX_ROWS)
+    };
+    let want_h = 2 + 1 + 1 + list_rows as u16;
+    let popup = popup_rect(area, 64, want_h, true);
+    if popup.width < 12 || popup.height < 3 {
+        return;
     }
+
+    let (title, prompt) = if search {
+        (" Search YouTube Music ", " / ")
+    } else {
+        (" Command ", " : ")
+    };
+    let footer = if search {
+        " ⏎ search · ↑↓ history · Esc close "
+    } else {
+        " ⏎ run · Tab complete · Esc close "
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if search { ACCENT } else { ACCENT }))
+        .title(Span::styled(
+            title,
+            Style::new()
+                .fg(if search { ACCENT } else { ACCENT })
+                .bold(),
+        ))
+        .title_bottom(Line::styled(footer, dim()).right_aligned());
+    let inner = block.inner(popup);
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+
+    let [input, sep, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+
+    let prompt_w = prompt.chars().count();
+    let avail = (input.width as usize).saturating_sub(prompt_w + 1);
+    let chars: Vec<char> = app.cmd_buf.chars().collect();
+    let shown: String = chars[chars.len().saturating_sub(avail)..].iter().collect();
+    let shown_w = shown.chars().count();
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                prompt,
+                Style::new().fg(Color::Black).bg(if search { ACCENT } else { ACCENT }).bold(),
+            ),
+            Span::raw(" "),
+            Span::styled(shown, Style::new().fg(Color::White)),
+        ])),
+        input,
+    );
+    if input.width as usize > prompt_w + 1 {
+        f.set_cursor_position((input.x + (prompt_w + 1 + shown_w) as u16, input.y));
+    }
+    f.render_widget(
+        Paragraph::new("─".repeat(sep.width as usize)).style(dim()),
+        sep,
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    if search {
+        if recent.is_empty() {
+            lines.push(Line::styled(" type what you want to hear, then press Enter", dim()));
+        } else {
+            for r in recent {
+                lines.push(Line::from(vec![
+                    Span::styled(" ↺ ", dim()),
+                    Span::styled(r.to_string(), Style::new().fg(Color::Gray)),
+                ]));
+            }
+        }
+    } else if typing_args {
+        let d = cmd_info(first_word);
+        lines.push(if d.is_empty() {
+            Line::styled(" ⏎ run", dim())
+        } else {
+            Line::from(vec![
+                Span::styled(format!(" {first_word} "), Style::new().fg(ACCENT).bold()),
+                Span::styled(d, dim()),
+            ])
+        });
+    } else if matches.is_empty() {
+        lines.push(Line::styled(" no matching command", Style::new().fg(Color::Red)));
+    } else {
+        let sel = app.cycling().then_some(app.cmd_sel);
+        let start = sel.map_or(0, |s| (s + 1).saturating_sub(MAX_ROWS));
+        let width = list.width as usize;
+        for (i, name) in matches.iter().enumerate().skip(start).take(MAX_ROWS) {
+            let text = format!(" {name:<10}{}", cmd_info(name));
+            let text: String = text.chars().take(width).collect();
+            lines.push(if Some(i) == sel {
+                let pad = width.saturating_sub(text.chars().count());
+                Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style())
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        text.chars().take(11).collect::<String>(),
+                        Style::new().fg(ACCENT),
+                    ),
+                    Span::styled(text.chars().skip(11).collect::<String>(), dim()),
+                ])
+            });
+        }
+    }
+    f.render_widget(Paragraph::new(lines), list);
+}
+
+fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
+    let items = &app.menu_items;
+    if items.is_empty() {
+        return;
+    }
+    let label_w = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0);
+    let detail_w = items.iter().map(|i| i.detail.chars().count()).max().unwrap_or(0);
+    let body_w = 5 + label_w + if detail_w > 0 { detail_w + 3 } else { 0 } + 2;
+    let title_w = app.menu_title.chars().count() + 6;
+    let w = body_w.max(title_w).clamp(34, 60) as u16;
+    let popup = popup_rect(area, w, items.len() as u16 + 2, false);
+    if popup.width < 12 || popup.height < 3 {
+        return;
+    }
+
+    let max_title = (popup.width as usize).saturating_sub(8);
+    let mut title: String = app.menu_title.chars().take(max_title).collect();
+    if app.menu_title.chars().count() > max_title {
+        title.push('…');
+    }
+    let title = if app.menu_sub {
+        format!(" {title} ")
+    } else {
+        format!(" ♪ {title} ")
+    };
+    let footer = if app.menu_sub {
+        " ⏎ add · Esc back "
+    } else {
+        " ⏎ select · Esc close "
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(title, Style::new().fg(ACCENT).bold()))
+        .title_bottom(Line::styled(footer, dim()).right_aligned());
+    let inner = block.inner(popup);
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+
+    let width = inner.width as usize;
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            let key = if it.key == NO_KEY { ' ' } else { it.key };
+            let label = format!("{:<label_w$}", it.label);
+            let selected = i == app.menu_sel;
+            if selected {
+                let mut text = format!(" {key}  {label}");
+                if !it.detail.is_empty() {
+                    text.push_str(&format!("   {}", it.detail));
+                }
+                let text: String = text.chars().take(width).collect();
+                let pad = width.saturating_sub(text.chars().count());
+                return Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style());
+            }
+            let danger = matches!(
+                it.action,
+                MenuAction::Remove | MenuAction::DeletePlaylist | MenuAction::ClearQueue
+            );
+            let label_style = if danger {
+                Style::new().fg(Color::Red)
+            } else {
+                Style::new().fg(Color::White)
+            };
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(key.to_string(), Style::new().fg(Color::Yellow).bold()),
+                Span::raw("  "),
+                Span::styled(label, label_style),
+            ];
+            if !it.detail.is_empty() {
+                spans.push(Span::styled(format!("   {}", it.detail), dim()));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let name = app.pending_delete.as_deref().unwrap_or_default();
+    let msg = format!(" Delete playlist \u{201c}{name}\u{201d}? ");
+    let w = (msg.chars().count() as u16 + 4).max(34);
+    let popup = popup_rect(area, w, 5, false);
+    if popup.width < 12 || popup.height < 3 {
+        return;
+    }
+    let lines = vec![
+        Line::styled(msg, Style::new().fg(Color::White).bold()),
+        Line::from(vec![
+            Span::styled(" y ", Style::new().fg(Color::Black).bg(Color::Red).bold()),
+            Span::styled(" delete   ", dim()),
+            Span::styled(" any other key ", Style::new().fg(Color::Gray)),
+            Span::styled(" cancel", dim()),
+        ]),
+    ];
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Confirm ")
+                .border_style(Style::new().fg(Color::Yellow)),
+        ),
+        popup,
+    );
 }
 
 const HELP: &[(&str, &str)] = &[
@@ -437,7 +882,7 @@ const HELP: &[(&str, &str)] = &[
     ("q  Esc  ?", "close"),
     ("NAVIGATION", "#"),
     ("j k / ↓ ↑", "move (counts work: 5j)"),
-    ("gg  G", "top / bottom (5G → row 5)"),
+    ("gg  ge  Home  End", "top / bottom (5gg or 5ge → row 5)"),
     ("Ctrl-d  Ctrl-u", "half page down / up"),
     ("Tab  S-Tab", "cycle Results / Queue / Playlists"),
     ("gr  gq  gp", "jump to Results / Queue / Playlists"),
@@ -455,6 +900,12 @@ const HELP: &[(&str, &str)] = &[
         "ga  or  :artist",
         "songs by the artist of the selected song; a popup asks which one when there are several",
     ),
+    ("SONG MENU  ( G )", "#"),
+    ("G", "menu for the highlighted song or playlist"),
+    ("j k  ⏎", "move / choose (the yellow letter is a shortcut)"),
+    ("p n a g l", "play · play next · add to queue · artist · playlist"),
+    ("x i", "remove · song info"),
+    ("Esc  q  G", "close (Esc goes back from a sub-menu)"),
     ("QUEUE", "#"),
     ("a  A  P", "add selected / add all / play all results"),
     (
@@ -648,8 +1099,8 @@ mod tests {
     fn open_playlist_renders() {
         let dir = std::env::temp_dir().join(format!("drift-ui-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &dir);
-        std::env::set_var("XDG_STATE_HOME", &dir);
+        std::env::set_var("DRIFT_CONFIG_DIR", &dir);
+        std::env::set_var("DRIFT_STATE_DIR", &dir);
 
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(tx);
@@ -690,6 +1141,33 @@ mod tests {
 
         let mut tiny = Terminal::new(TestBackend::new(20, 6)).unwrap();
         tiny.draw(|f| draw(f, &mut app)).unwrap();
+
+        key(&mut app, KeyCode::Char(':'));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(text(&term).contains("Command"));
+        key(&mut app, KeyCode::Tab);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Char('/'));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(text(&term).contains("Search YouTube Music"));
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
+        key(&mut app, KeyCode::Esc);
+
+        key(&mut app, KeyCode::Char('G'));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(text(&term).contains("Play now"));
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
+        key(&mut app, KeyCode::Char('l'));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(text(&term).contains("New playlist"));
+        key(&mut app, KeyCode::Esc);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(text(&term).contains("Play now"));
+        key(&mut app, KeyCode::Esc);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!text(&term).contains("Play now"));
 
         key(&mut app, KeyCode::Char('?'));
         term.draw(|f| draw(f, &mut app)).unwrap();

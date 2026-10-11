@@ -5,6 +5,7 @@ mod model;
 mod player;
 mod session;
 mod store;
+mod sys;
 mod ui;
 mod ytmusic;
 
@@ -30,12 +31,9 @@ USAGE:
 Inside the player press ? for key bindings and :help for commands.";
 
 fn tool_version(name: &str) -> Option<String> {
-    let out = Command::new(name)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(name);
+    cmd.arg("--version").stdin(Stdio::null()).stderr(Stdio::null());
+    let out = sys::no_window(&mut cmd).output().ok()?;
     out.status.success().then(|| {
         String::from_utf8_lossy(&out.stdout)
             .lines()
@@ -51,11 +49,11 @@ fn missing_dependencies(verbose: bool) -> Vec<String> {
     for (tool, hint) in [
         (
             "mpv",
-            "sudo apt install mpv | brew install mpv | sudo pacman -S mpv | winget install mpv",
+            "sudo apt install mpv | brew install mpv | sudo pacman -S mpv | winget install mpv.net / scoop install mpv",
         ),
         (
             "yt-dlp",
-            "pipx install yt-dlp | brew install yt-dlp | sudo pacman -S yt-dlp | winget install yt-dlp",
+            "pipx install yt-dlp | brew install yt-dlp | sudo pacman -S yt-dlp | winget install yt-dlp.yt-dlp / scoop install yt-dlp",
         ),
     ] {
         match tool_version(tool) {

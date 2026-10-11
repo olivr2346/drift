@@ -156,6 +156,7 @@ impl Player {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        crate::sys::no_window(&mut cmd);
 
         // Linux only: ask the kernel to SIGTERM mpv if drift dies unexpectedly.
         #[cfg(target_os = "linux")]
@@ -174,6 +175,9 @@ impl Player {
                 anyhow!("failed to start mpv: {e}")
             }
         })?;
+
+        // Windows: tie mpv's lifetime to ours.
+        crate::sys::kill_on_exit(&child);
 
         let start = Instant::now();
         let (reader, writer) = loop {

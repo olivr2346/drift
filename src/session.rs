@@ -17,8 +17,7 @@ pub struct Session {
 
 impl Session {
     fn path() -> Result<PathBuf> {
-        let dir = dirs::state_dir()
-            .or_else(dirs::data_local_dir)
+        let dir = crate::store::state_base()
             .ok_or_else(|| anyhow!("cannot determine state directory"))?;
         Ok(dir.join("drift").join("session.json"))
     }

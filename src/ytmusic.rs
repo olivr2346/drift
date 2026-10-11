@@ -305,8 +305,8 @@ fn ytdlp_search(query: &str) -> Result<Vec<Track>> {
 }
 
 fn ytdlp_entries(target: &str) -> Result<Vec<Track>> {
-    let out = Command::new("yt-dlp")
-        .args([
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args([
             "--flat-playlist",
             "--dump-json",
             "--no-warnings",
@@ -315,7 +315,8 @@ fn ytdlp_entries(target: &str) -> Result<Vec<Track>> {
             "15",
         ])
         .arg(target)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    let out = crate::sys::no_window(&mut cmd)
         .output()
         .map_err(|e| anyhow!("could not run yt-dlp ({e}); is it installed and on PATH?"))?;
 

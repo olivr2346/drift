@@ -18,13 +18,44 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
     }
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
-    Ok(())
+    // On Windows the rename can fail briefly while an antivirus scanner or
+    // indexer holds the destination open, so retry a few times.
+    let mut last = None;
+    for attempt in 0..6 {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                if attempt < 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+    Err(last.expect("at least one attempt"))
+        .with_context(|| format!("replacing {}", path.display()))
+}
+
+/// Base directory for settings and playlists (`DRIFT_CONFIG_DIR` overrides it).
+pub fn config_base() -> Option<PathBuf> {
+    std::env::var_os("DRIFT_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::config_dir)
+}
+
+/// Base directory for the saved session (`DRIFT_STATE_DIR` overrides it).
+/// `dirs::state_dir()` is `None` on Windows and macOS, so fall back to local data.
+pub fn state_base() -> Option<PathBuf> {
+    std::env::var_os("DRIFT_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::state_dir)
+        .or_else(dirs::data_local_dir)
 }
 
 impl Store {
     pub fn dir() -> Result<PathBuf> {
-        let dir = dirs::config_dir().ok_or_else(|| anyhow!("cannot determine config directory"))?;
+        let dir = config_base().ok_or_else(|| anyhow!("cannot determine config directory"))?;
         let new_dir = dir.join("drift");
         let old_dir = dir.join("ytm-tui");
         if !new_dir.exists() && old_dir.exists() {
