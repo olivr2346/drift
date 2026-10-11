@@ -7,13 +7,12 @@ use ratatui::Frame;
 use crate::app::{App, Level, MenuAction, Mode, PlayState, View, NO_KEY};
 use crate::model::{fmt_time, Track};
 
-const ACCENT: Color = Color::Cyan;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn selected_style() -> Style {
+fn selected_style(accent: Color) -> Style {
     Style::new()
         .fg(Color::Black)
-        .bg(ACCENT)
+        .bg(accent)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -87,7 +86,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     .areas(area);
 
     f.render_widget(
-        Paragraph::new(" Drift").style(Style::new().fg(ACCENT).bold()),
+        Paragraph::new(" Drift").style(Style::new().fg(app.accent).bold()),
         name,
     );
 
@@ -100,7 +99,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         Tabs::new(titles)
             .select(app.view.idx())
             .style(Style::new().fg(Color::Gray))
-            .highlight_style(Style::new().fg(Color::Black).bg(ACCENT).bold())
+            .highlight_style(Style::new().fg(Color::Black).bg(app.accent).bold())
             .divider(" "),
         tabs,
     );
@@ -167,7 +166,7 @@ fn track_rows<'a>(
         .collect()
 }
 
-fn track_table<'a>(rows: Vec<Row<'a>>, show_album: bool, block: Block<'a>) -> Table<'a> {
+fn track_table<'a>(rows: Vec<Row<'a>>, show_album: bool, block: Block<'a>, accent: Color) -> Table<'a> {
     let mut header = vec!["", "  #", "Title", "Artist"];
     let mut widths = vec![
         Constraint::Length(2),
@@ -186,7 +185,7 @@ fn track_table<'a>(rows: Vec<Row<'a>>, show_album: bool, block: Block<'a>) -> Ta
         .header(Row::new(header).style(header_style()))
         .block(block)
         .column_spacing(1)
-        .row_highlight_style(selected_style())
+        .row_highlight_style(selected_style(accent))
 }
 
 fn empty_hint(f: &mut Frame, block: Block, area: Rect, lines: &[&str]) {
@@ -210,7 +209,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, view: View) {
     };
     let mut block = Block::bordered()
         .title(format!("{title}({}) ", tracks.len()))
-        .border_style(Style::new().fg(ACCENT));
+        .border_style(Style::new().fg(app.accent));
     if !tracks.is_empty() {
         let keys: &[(&str, &str)] = if view == View::Queue {
             &[("⏎", "play"), ("x", "remove"), ("J/K", "move"), ("G", "menu"), ("?", "help")]
@@ -239,7 +238,7 @@ fn draw_tracks(f: &mut Frame, app: &mut App, area: Rect, view: View) {
         return empty_hint(f, block, area, hint);
     }
     let rows = track_rows(tracks, playing, show_album);
-    let table = track_table(rows, show_album, block);
+    let table = track_table(rows, show_album, block, app.accent);
     let idx = view.idx();
     f.render_stateful_widget(table, area, &mut app.states[idx]);
 }
@@ -253,7 +252,7 @@ fn draw_open_playlist(f: &mut Frame, app: &mut App, area: Rect, name: &str) {
     };
     let mut block = Block::bordered()
         .title(format!(" {name} ({}) ", tracks.len()))
-        .border_style(Style::new().fg(ACCENT));
+        .border_style(Style::new().fg(app.accent));
     if !tracks.is_empty() {
         let keys = [("⏎", "play"), ("a", "queue"), ("x", "remove"), ("G", "menu"), ("←", "back")];
         if let Some(h) = hints(&keys, area.width) {
@@ -274,7 +273,7 @@ fn draw_open_playlist(f: &mut Frame, app: &mut App, area: Rect, name: &str) {
     }
     let show_album = area.width >= 76;
     let rows = track_rows(tracks, playing, show_album);
-    let table = track_table(rows, show_album, block);
+    let table = track_table(rows, show_album, block, app.accent);
     f.render_stateful_widget(table, area, &mut app.pl_state);
 }
 
@@ -289,7 +288,7 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut block = Block::bordered()
         .title(format!(" Playlists ({}) ", app.store.playlists.len()))
-        .border_style(Style::new().fg(ACCENT));
+        .border_style(Style::new().fg(app.accent));
     if !app.store.playlists.is_empty() {
         if let Some(h) = hints(&[("⏎", "load"), ("→", "open"), ("G", "menu")], left.width) {
             block = block.title_bottom(h);
@@ -336,7 +335,7 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     )
     .header(Row::new(vec!["", "Name", "Songs"]).style(header_style()))
     .block(block)
-    .row_highlight_style(selected_style());
+    .row_highlight_style(selected_style(app.accent));
     f.render_stateful_widget(table, left, &mut app.states[View::Playlists.idx()]);
 
     let sel = app.selected();
@@ -348,7 +347,7 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
         Some(tracks) if !tracks.is_empty() => {
             let show_album = right.width >= 70;
             let rows = track_rows(tracks, None, show_album);
-            f.render_widget(track_table(rows, show_album, preview_block), right);
+            f.render_widget(track_table(rows, show_album, preview_block, app.accent), right);
         }
         _ => f.render_widget(preview_block, right),
     }
@@ -356,8 +355,8 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
 
 const BARS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 
-fn gradient(_t: f64) -> Color {
-    ACCENT
+fn gradient(_t: f64, accent: Color) -> Color {
+    accent
 }
 
 fn equalizer(app: &App, n: usize) -> Vec<Span<'static>> {
@@ -373,7 +372,7 @@ fn equalizer(app: &App, n: usize) -> Vec<Span<'static>> {
                 _ => 0,
             };
             let color = if app.play_state == PlayState::Playing {
-                gradient(x / n as f64)
+                gradient(x / n as f64, app.accent)
             } else {
                 Color::DarkGray
             };
@@ -386,10 +385,10 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
     let active = app.play_state != PlayState::Stopped;
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if active { ACCENT } else { Color::DarkGray }))
+        .border_style(Style::new().fg(if active { app.accent } else { Color::DarkGray }))
         .title(Line::from(vec![
-            Span::styled(" ♪ ", Style::new().fg(ACCENT).bold()),
-            Span::styled("Now Playing ", Style::new().fg(ACCENT).bold()),
+            Span::styled(" ♪ ", Style::new().fg(app.accent).bold()),
+            Span::styled("Now Playing ", Style::new().fg(app.accent).bold()),
         ]));
 
     let mut pending = String::new();
@@ -410,7 +409,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
     let [l1, l2] = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).areas(inner);
 
-    let on = Style::new().fg(ACCENT).bold();
+    let on = Style::new().fg(app.accent).bold();
     let vol_cells = 5usize;
     let vol_fill = ((app.volume as usize * vol_cells) + 50) / 100;
     let mut flags = vec![
@@ -432,7 +431,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
     ];
     for i in 0..vol_cells {
         flags.push(if i < vol_fill.min(vol_cells) {
-            Span::styled("━", Style::new().fg(gradient(i as f64 / vol_cells as f64)))
+            Span::styled("━", Style::new().fg(gradient(i as f64 / vol_cells as f64, app.accent)))
         } else {
             Span::styled("─", dim())
         });
@@ -466,7 +465,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
         (Some(t), true) => {
             spans.push(Span::styled(t.title.clone(), Style::new().fg(Color::White).bold()));
             spans.push(Span::styled("  ·  ", dim()));
-            spans.push(Span::styled(t.artist.clone(), Style::new().fg(ACCENT)));
+            spans.push(Span::styled(t.artist.clone(), Style::new().fg(app.accent)));
         }
         (Some(t), false) => spans.push(Span::styled(
             format!("Last played: {} — {}", t.title, t.artist),
@@ -497,7 +496,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
         line.push(if !active || app.duration <= 0.0 {
             Span::styled("─", dim())
         } else if i < head {
-            Span::styled("━", Style::new().fg(gradient(i as f64 / bar_w.max(1) as f64)))
+            Span::styled("━", Style::new().fg(gradient(i as f64 / bar_w.max(1) as f64, app.accent)))
         } else if i == head {
             Span::styled("●", Style::new().fg(Color::White).bold())
         } else {
@@ -580,8 +579,8 @@ fn draw_info(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(ACCENT))
-                .title(Span::styled(" ♪ Song info ", Style::new().fg(ACCENT).bold()))
+                .border_style(Style::new().fg(app.accent))
+                .title(Span::styled(" ♪ Song info ", Style::new().fg(app.accent).bold()))
                 .title_bottom(Line::styled(" any key to close ", dim()).right_aligned()),
         ),
         popup,
@@ -676,11 +675,11 @@ fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(if search { ACCENT } else { ACCENT }))
+        .border_style(Style::new().fg(if search { app.accent } else { app.accent }))
         .title(Span::styled(
             title,
             Style::new()
-                .fg(if search { ACCENT } else { ACCENT })
+                .fg(if search { app.accent } else { app.accent })
                 .bold(),
         ))
         .title_bottom(Line::styled(footer, dim()).right_aligned());
@@ -704,7 +703,7 @@ fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(vec![
             Span::styled(
                 prompt,
-                Style::new().fg(Color::Black).bg(if search { ACCENT } else { ACCENT }).bold(),
+                Style::new().fg(Color::Black).bg(if search { app.accent } else { app.accent }).bold(),
             ),
             Span::raw(" "),
             Span::styled(shown, Style::new().fg(Color::White)),
@@ -737,7 +736,7 @@ fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
             Line::styled(" ⏎ run", dim())
         } else {
             Line::from(vec![
-                Span::styled(format!(" {first_word} "), Style::new().fg(ACCENT).bold()),
+                Span::styled(format!(" {first_word} "), Style::new().fg(app.accent).bold()),
                 Span::styled(d, dim()),
             ])
         });
@@ -752,12 +751,12 @@ fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
             let text: String = text.chars().take(width).collect();
             lines.push(if Some(i) == sel {
                 let pad = width.saturating_sub(text.chars().count());
-                Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style())
+                Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style(app.accent))
             } else {
                 Line::from(vec![
                     Span::styled(
                         text.chars().take(11).collect::<String>(),
-                        Style::new().fg(ACCENT),
+                        Style::new().fg(app.accent),
                     ),
                     Span::styled(text.chars().skip(11).collect::<String>(), dim()),
                 ])
@@ -799,14 +798,15 @@ fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
-        .title(Span::styled(title, Style::new().fg(ACCENT).bold()))
+        .border_style(Style::new().fg(app.accent))
+        .title(Span::styled(title, Style::new().fg(app.accent).bold()))
         .title_bottom(Line::styled(footer, dim()).right_aligned());
     let inner = block.inner(popup);
     f.render_widget(Clear, popup);
     f.render_widget(block, popup);
 
     let width = inner.width as usize;
+    let accent = app.accent;
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
@@ -821,7 +821,7 @@ fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
                 }
                 let text: String = text.chars().take(width).collect();
                 let pad = width.saturating_sub(text.chars().count());
-                return Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style());
+                return Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style(accent));
             }
             let danger = matches!(
                 it.action,
@@ -966,10 +966,10 @@ fn wrap_words(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn help_lines(inner_w: usize) -> Vec<Line<'static>> {
+fn help_lines(inner_w: usize, accent: Color) -> Vec<Line<'static>> {
     let key_w = HELP_KEY_W.min(inner_w / 2).max(1);
     let desc_w = inner_w.saturating_sub(key_w);
-    let key_style = Style::new().fg(ACCENT);
+    let key_style = Style::new().fg(accent);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for (k, d) in HELP {
@@ -1025,7 +1025,7 @@ fn draw_artist_picker(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, name)| {
             let text = format!(" {} {name}", i + 1);
             if i == app.artist_sel {
-                Line::styled(text, selected_style())
+                Line::styled(text, selected_style(app.accent))
             } else {
                 Line::raw(text)
             }
@@ -1045,7 +1045,7 @@ fn draw_artist_picker(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     let w = area.width.min(80);
-    let lines = help_lines(w.saturating_sub(2) as usize);
+    let lines = help_lines(w.saturating_sub(2) as usize, app.accent);
     let h = (lines.len() as u16).saturating_add(2).min(area.height);
     let popup = Rect {
         x: area.x + (area.width - w) / 2,

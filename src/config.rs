@@ -1,12 +1,32 @@
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::Result;
-use serde::Deserialize;
+use ratatui::style::Color;
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer};
 
 use crate::model::{RepeatMode, Track};
 use crate::session::Session;
 use crate::store::{write_atomic, Store};
+
+fn deserialize_color<'de, D>(deserializer: D) -> Result<Color, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ColorVisitor;
+    impl<'de> Visitor<'de> for ColorVisitor {
+        type Value = Color;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a color name (e.g. \"cyan\") or hex value (e.g. \"#FF8800\")")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Color, E> {
+            Color::from_str(v).map_err(de::Error::custom)
+        }
+    }
+    deserializer.deserialize_str(ColorVisitor)
+}
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
@@ -54,11 +74,29 @@ pub struct Artist {
     pub popular_first: bool,
 }
 
+fn default_accent() -> Color {
+    Color::Cyan
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Ui {
+    #[serde(deserialize_with = "deserialize_color")]
+    pub accent: Color,
+}
+
+impl Default for Ui {
+    fn default() -> Self {
+        Ui { accent: default_accent() }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub playback: Playback,
     pub artist: Artist,
+    pub ui: Ui,
 }
 
 impl Config {
@@ -66,7 +104,27 @@ impl Config {
         Ok(Store::dir()?.join("config.toml"))
     }
 
-    pub fn render(p: &Playback, a: &Artist) -> String {
+    pub fn render(p: &Playback, a: &Artist, u: &Ui) -> String {
+        let accent = match u.accent {
+            Color::Reset => "reset",
+            Color::Black => "black",
+            Color::Red => "red",
+            Color::Green => "green",
+            Color::Yellow => "yellow",
+            Color::Blue => "blue",
+            Color::Magenta => "magenta",
+            Color::Cyan => "cyan",
+            Color::Gray => "gray",
+            Color::DarkGray => "dark-gray",
+            Color::LightRed => "light-red",
+            Color::LightGreen => "light-green",
+            Color::LightYellow => "light-yellow",
+            Color::LightBlue => "light-blue",
+            Color::LightMagenta => "light-magenta",
+            Color::LightCyan => "light-cyan",
+            Color::White => "white",
+            _ => "cyan",
+        };
         format!(
             "\
 # Drift settings. Drift only reads this file and never rewrites it, so your
@@ -84,6 +142,14 @@ volume_step = {vstep:?}
 [artist]
 # :artist and ga list the artist's most popular songs first, then more of their songs below
 popular_first = {popular}
+
+[ui]
+# Accent color used throughout the UI.
+# Named colors: black, red, green, yellow, blue, magenta, cyan, gray, dark-gray,
+#               light-red, light-green, light-yellow, light-blue, light-magenta,
+#               light-cyan, white
+# Or use a hex value: \"#FF8800\"
+accent = \"{accent}\"
 ",
             volume = p.volume,
             shuffle = p.shuffle,
@@ -93,6 +159,7 @@ popular_first = {popular}
             seek = p.seek_step,
             vstep = p.volume_step,
             popular = a.popular_first,
+            accent = accent,
         )
     }
 
@@ -107,7 +174,7 @@ popular_first = {popular}
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = Self::write(&Self::render(&Playback::default(), &Artist::default()));
+                let _ = Self::write(&Self::render(&Playback::default(), &Artist::default(), &Ui::default()));
                 return (Config::default(), None);
             }
             Err(e) => {
@@ -186,7 +253,7 @@ pub fn migrate_legacy() {
             let _ = Session::write(&s);
         }
     }
-    let _ = Config::write(&Config::render(&p, &Artist::default()));
+    let _ = Config::write(&Config::render(&p, &Artist::default(), &Ui::default()));
 }
 
 #[cfg(test)]
@@ -195,7 +262,7 @@ mod tests {
 
     #[test]
     fn default_file_parses_back() {
-        let text = Config::render(&Playback::default(), &Artist::default());
+        let text = Config::render(&Playback::default(), &Artist::default(), &Ui::default());
         let c: Config = toml::from_str(&text).unwrap();
         let d = Playback::default();
         assert_eq!(c.playback.volume, d.volume);
@@ -237,5 +304,33 @@ mod tests {
         };
         p.sanitize();
         assert_eq!((p.volume, p.seek_step, p.volume_step), (100, 5.0, 100.0));
+    }
+
+    #[test]
+    fn accent_color_parsing() {
+        // Default is cyan
+        let c: Config = toml::from_str("").unwrap();
+        assert_eq!(c.ui.accent, Color::Cyan);
+
+        // Named colors
+        let c: Config = toml::from_str("[ui]\naccent = \"red\"").unwrap();
+        assert_eq!(c.ui.accent, Color::Red);
+        let c: Config = toml::from_str("[ui]\naccent = \"green\"").unwrap();
+        assert_eq!(c.ui.accent, Color::Green);
+        let c: Config = toml::from_str("[ui]\naccent = \"magenta\"").unwrap();
+        assert_eq!(c.ui.accent, Color::Magenta);
+
+        // Hex value
+        let c: Config = toml::from_str("[ui]\naccent = \"#FF8800\"").unwrap();
+        assert_eq!(c.ui.accent, Color::Rgb(255, 136, 0));
+
+        // Invalid color is an error
+        assert!(toml::from_str::<Config>("[ui]\naccent = \"notacolor\"").is_err());
+
+        // Roundtrip: render then parse
+        let u = Ui { accent: Color::Blue };
+        let text = Config::render(&Playback::default(), &Artist::default(), &u);
+        let c: Config = toml::from_str(&text).unwrap();
+        assert_eq!(c.ui.accent, Color::Blue);
     }
 }
