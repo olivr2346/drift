@@ -21,17 +21,14 @@ Stream your favourite music from YouTube Music — all in one client, in your te
 
 ## Features
 
-- **YouTube Music streaming** - search and stream tracks directly from YouTube Music via `yt-dlp` and `mpv`
-- **Vim-style keybinds** - navigate with `j`/`k`, enter commands with `:`, quit with `q`
-- **Queue management** - add, remove, reorder, and clear tracks in your queue
-- **Playlists** - save, load, append, and delete named playlists; import from YouTube/YouTube Music URLs
-- **Shuffle & repeat** - toggle shuffle and cycle through off / repeat-all / repeat-one modes
-- **Volume & seek control** - adjust volume and seek with configurable step sizes
-- **Session restore** - automatically restores your queue and playback position on next launch
-- **Artist search** - drill into an artist's discography from the results view
-- **Command palette** - full `:command` interface (`:search`, `:play`, `:volume`, `:seek`, `:save`, `:load`, `:import`, and more)
-- **Autoplay** - optionally keep playing through results when the queue ends
-- **TOML config** - persistent config at `~/.config/drift/config.toml` (your platform's config directory); drift never rewrites it, so comments are preserved
+- **YouTube Music streaming** - search and play tracks straight from YouTube Music, with no account or login
+- **Vim-style keybinds** - move with `j`/`k`, jump with `gg`/`ge`, use counts like `5j`, and open the command line with `:`
+- **Song context menu** - press `G` on any song for quick actions: play, queue, add to playlist, show artist, and song info
+- **Command palette** - a redesigned `:` prompt with the full command set (`:search`, `:seek`, `:vol`, `:import`, and more)
+- **Audio visualizer** - a live visualizer in the bottom-left corner while music plays
+- **Playlists & queue** - save, load, and reorder playlists, or import any YouTube / YouTube Music playlist by URL
+- **Artist browsing** - press `ga` to jump to an artist's songs
+- **Session restore** - your queue and playback position come back the next time you launch
 
 ---
 
