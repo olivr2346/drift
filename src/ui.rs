@@ -1,10 +1,11 @@
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Level, MenuAction, Mode, PlayState, View, NO_KEY};
+use crate::app::{App, Level, LyricsState, MenuAction, Mode, PlayState, View, NO_KEY};
+use crate::lyrics::Lyrics;
 use crate::model::{fmt_time, Track};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -33,11 +34,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     ])
     .areas(area);
 
-    draw_tabs(f, app, top);
-    match app.view {
-        View::Results => draw_tracks(f, app, body, View::Results),
-        View::Queue => draw_tracks(f, app, body, View::Queue),
-        View::Playlists => draw_playlists(f, app, body),
+    if app.mode == Mode::Lyrics {
+        draw_lyrics_header(f, app, top);
+        draw_lyrics(f, app, body, true);
+    } else {
+        draw_tabs(f, app, top);
+        let list = if app.lyrics_panel && body.width >= 70 {
+            let [list, side] =
+                Layout::horizontal([Constraint::Min(40), Constraint::Percentage(40)]).areas(body);
+            draw_lyrics(f, app, side, false);
+            list
+        } else {
+            body
+        };
+        match app.view {
+            View::Results => draw_tracks(f, app, list, View::Results),
+            View::Queue => draw_tracks(f, app, list, View::Queue),
+            View::Playlists => draw_playlists(f, app, list),
+        }
     }
     draw_now_playing(f, app, playing);
     if app.mode == Mode::Command {
@@ -79,30 +93,42 @@ fn hints(items: &[(&str, &str)], width: u16) -> Option<Line<'static>> {
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     let [name, tabs, right] = Layout::horizontal([
-        Constraint::Length(9),
+        Constraint::Length(10),
         Constraint::Min(10),
-        Constraint::Length(34),
+        Constraint::Length(app.busy.as_ref().map_or(0, |b| b.chars().count() as u16 + 5)),
     ])
     .areas(area);
 
     f.render_widget(
-        Paragraph::new(" Drift").style(Style::new().fg(app.accent).bold()),
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ♪ ", Style::new().fg(app.accent)),
+            Span::styled("Drift", Style::new().fg(app.accent).bold()),
+        ])),
         name,
     );
 
     let titles = [
-        format!(" Results {} ", app.results.len()),
-        format!(" Queue {} ", app.queue.len()),
-        format!(" Playlists {} ", app.store.playlists.len()),
+        ("Results", app.results.len()),
+        ("Queue", app.queue.len()),
+        ("Playlists", app.store.playlists.len()),
     ];
-    f.render_widget(
-        Tabs::new(titles)
-            .select(app.view.idx())
-            .style(Style::new().fg(Color::Gray))
-            .highlight_style(Style::new().fg(Color::Black).bg(app.accent).bold())
-            .divider(" "),
-        tabs,
-    );
+    let pill = Style::new().fg(Color::Black).bg(app.accent);
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, (title, count)) in titles.into_iter().enumerate() {
+        if i == app.view.idx() {
+            spans.push(Span::styled("▐", Style::new().fg(app.accent)));
+            spans.push(Span::styled(format!(" {title} "), pill.bold()));
+            spans.push(Span::styled(format!("{count} "), pill));
+            spans.push(Span::styled("▌", Style::new().fg(app.accent)));
+        } else {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!(" {title} "), Style::new().fg(Color::Gray)));
+            spans.push(Span::styled(format!("{count} "), dim()));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::raw(" "));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), tabs);
 
     if let Some(busy) = &app.busy {
         let spin = SPINNER[app.tick % SPINNER.len()];
@@ -507,6 +533,153 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(line)), l2);
 }
 
+fn draw_lyrics_header(f: &mut Frame, app: &App, area: Rect) {
+    let unsynced = matches!(&app.lyrics, LyricsState::Ready(l) if !l.synced);
+    let mut title = vec![
+        Span::styled(" Drift", Style::new().fg(app.accent).bold()),
+        Span::styled("  ·  Lyrics", dim()),
+    ];
+    if unsynced {
+        title.push(Span::styled("  ·  not synced", dim()));
+    }
+    f.render_widget(Paragraph::new(Line::from(title)), area);
+
+    let mut keys = vec![("space", "pause"), ("h l", "seek"), ("n N", "skip")];
+    if unsynced {
+        keys.insert(0, ("j k", "scroll"));
+    }
+    keys.push(("Esc", "close"));
+    if let Some(h) = hints(&keys, area.width.saturating_sub(30)) {
+        f.render_widget(Paragraph::new(h), area);
+    }
+}
+
+fn lyric_rows(
+    lyrics: &Lyrics,
+    position: f64,
+    width: usize,
+    roomy: bool,
+    accent: Color,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    let active = lyrics.active(position);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut focus = None;
+    for (i, line) in lyrics.lines.iter().enumerate() {
+        let parts = wrap_words(&line.text, width);
+        let is_active = active == Some(i);
+        if is_active {
+            focus = Some(rows.len() + parts.len().max(1) / 2);
+        }
+        if parts.is_empty() {
+            rows.push(if is_active {
+                Line::styled("♪", Style::new().fg(accent).bold())
+            } else {
+                Line::raw("")
+            });
+            continue;
+        }
+        if is_active {
+            let total: usize = parts.iter().map(|p| p.chars().count()).sum();
+            let mut fill = (lyrics.progress(i, position) * total as f64).round() as usize;
+            for part in parts {
+                let done = fill.min(part.chars().count());
+                fill -= done;
+                let sung: String = part.chars().take(done).collect();
+                let rest: String = part.chars().skip(done).collect();
+                rows.push(Line::from(vec![
+                    Span::styled(sung, Style::new().fg(accent).bold()),
+                    Span::styled(rest, Style::new().fg(Color::White).bold()),
+                ]));
+            }
+        } else {
+            let ahead = active.map_or(i as isize + 1, |a| i as isize - a as isize);
+            let color = match (lyrics.synced, ahead) {
+                (false, _) | (_, 1..=2) => Color::Gray,
+                _ => Color::DarkGray,
+            };
+            rows.extend(parts.into_iter().map(|p| Line::styled(p, Style::new().fg(color))));
+        }
+        if roomy {
+            rows.push(Line::raw(""));
+        }
+    }
+    (rows, focus)
+}
+
+fn draw_lyrics(f: &mut Frame, app: &mut App, area: Rect, full: bool) {
+    let inner = if full {
+        let w = area.width.saturating_sub(4).min(76);
+        Rect {
+            x: area.x + (area.width - w) / 2,
+            width: w,
+            ..area
+        }
+    } else {
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(dim())
+            .title(Span::styled(" ♪ Lyrics ", Style::new().fg(app.accent).bold()));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        inner.inner(Margin::new(1, 0))
+    };
+    if inner.width < 4 || inner.height == 0 {
+        return;
+    }
+
+    let now = app.now_track().map(|t| t.id.clone());
+    let playing = now.is_some() && app.play_state != PlayState::Stopped;
+    let fresh = playing && app.lyrics_id == now;
+    let notice: Option<Vec<Line>> = match &app.lyrics {
+        _ if !playing => Some(vec![Line::styled("Nothing playing", dim())]),
+        LyricsState::Ready(_) if fresh => None,
+        LyricsState::Missing if fresh => Some(vec![
+            Line::styled("No lyrics found", Style::new().fg(Color::Gray)),
+            Line::styled("not every song has them", dim()),
+        ]),
+        LyricsState::Failed(e) if fresh => Some(vec![
+            Line::styled("Couldn't load lyrics", Style::new().fg(Color::Red)),
+            Line::styled(e.clone(), dim()),
+        ]),
+        _ => Some(vec![Line::styled(
+            format!("{} Searching lyrics…", SPINNER[app.tick % SPINNER.len()]),
+            Style::new().fg(Color::Yellow),
+        )]),
+    };
+    if let Some(lines) = notice {
+        let h = (lines.len() as u16 + 1).min(inner.height);
+        let rect = Rect {
+            y: inner.y + (inner.height - h) / 2,
+            height: h,
+            ..inner
+        };
+        f.render_widget(
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            rect,
+        );
+        return;
+    }
+
+    let LyricsState::Ready(lyrics) = &app.lyrics else {
+        return;
+    };
+    let (rows, focus) = lyric_rows(lyrics, app.position, inner.width as usize, full, app.accent);
+    let height = inner.height as usize;
+    let max_start = rows.len().saturating_sub(height);
+    let start = if lyrics.synced {
+        focus.map_or(0, |r| r.saturating_sub(height / 2))
+    } else {
+        app.lyrics_scroll
+    }
+    .min(max_start);
+    app.lyrics_scroll = start;
+    let visible: Vec<Line> = rows.into_iter().skip(start).take(height).collect();
+    let align = if full { Alignment::Center } else { Alignment::Left };
+    f.render_widget(Paragraph::new(visible).alignment(align), inner);
+}
+
 fn draw_toast(f: &mut Frame, app: &App, body: Rect) {
     let Some(s) = app.visible_status() else {
         return;
@@ -628,6 +801,7 @@ const CMD_INFO: &[(&str, &str)] = &[
     ("addto", "add the selected track to a playlist"),
     ("import", "import a YouTube / YT Music playlist URL"),
     ("artist", "songs by the selected artist"),
+    ("lyrics", "show or hide the lyrics panel"),
     ("help", "show key bindings"),
 ];
 
@@ -896,6 +1070,7 @@ const HELP: &[(&str, &str)] = &[
     ("h l  / ← →", "seek -5s / +5s (counts: 6l)"),
     ("+  -", "volume up / down"),
     ("s  r", "toggle shuffle / cycle repeat"),
+    ("L  F", "lyrics side panel / fullscreen lyrics (Esc closes)"),
     (
         "ga  or  :artist",
         "songs by the artist of the selected song; a popup asks which one when there are several",
@@ -941,6 +1116,7 @@ const HELP: &[(&str, &str)] = &[
     (":addto n", "add the selected track to playlist n"),
     (":import URL", "load a YouTube / YT Music playlist"),
     (":artist", "same as ga"),
+    (":lyrics", "same as L"),
     (":quit  (or q, Ctrl-c)", ""),
 ];
 

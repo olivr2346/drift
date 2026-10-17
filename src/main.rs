@@ -1,6 +1,7 @@
 mod app;
 mod command;
 mod config;
+mod lyrics;
 mod model;
 mod player;
 mod session;

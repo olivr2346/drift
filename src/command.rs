@@ -36,6 +36,7 @@ pub enum Command {
     AddTo(String),
     Import(String),
     Artist,
+    Lyrics,
     Help,
 }
 
@@ -68,6 +69,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "addto",
     "import",
     "artist",
+    "lyrics",
     "help",
 ];
 
@@ -175,6 +177,7 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
             Import(arg.to_string())
         }
         "artist" | "ar" => Artist,
+        "lyrics" | "ly" => Lyrics,
         "help" | "h" => Help,
         other => return Err(format!("unknown command: :{other}  (try :help)")),
     };
@@ -238,6 +241,7 @@ mod tests {
     fn artist_command() {
         assert_eq!(parse("artist"), Ok(Some(Command::Artist)));
         assert_eq!(parse(":ar"), Ok(Some(Command::Artist)));
+        assert_eq!(parse("lyrics"), Ok(Some(Command::Lyrics)));
     }
 
     #[test]

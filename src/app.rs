@@ -8,6 +8,7 @@ use ratatui::widgets::TableState;
 
 use crate::command::{self, Amount, Command, COMMAND_NAMES};
 use crate::config::{self, Config};
+use crate::lyrics::{self, Lyrics};
 use crate::model::{fmt_time, split_artists, RepeatMode, Track};
 use crate::player::{Player, PlayerEvent};
 use crate::session::Session;
@@ -24,6 +25,10 @@ pub enum AppEvent {
     More {
         generation: u64,
         result: Result<Page, String>,
+    },
+    Lyrics {
+        id: String,
+        result: Result<Option<Lyrics>, String>,
     },
 }
 
@@ -60,6 +65,7 @@ pub enum Mode {
     Help,
     Menu,
     Info,
+    Lyrics,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +74,14 @@ pub enum PlayState {
     Loading,
     Playing,
     Paused,
+}
+
+pub enum LyricsState {
+    Idle,
+    Loading,
+    Ready(Lyrics),
+    Missing,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,6 +168,10 @@ pub struct App {
     pub artist_sel: usize,
     pub pending_delete: Option<String>,
     pub help_scroll: usize,
+    pub lyrics: LyricsState,
+    pub lyrics_panel: bool,
+    pub lyrics_scroll: usize,
+    pub lyrics_id: Option<String>,
     history: Vec<String>,
     hist_pos: Option<usize>,
     pub count: Option<usize>,
@@ -232,6 +250,10 @@ impl App {
             artist_sel: 0,
             pending_delete: None,
             help_scroll: 0,
+            lyrics: LyricsState::Idle,
+            lyrics_panel: false,
+            lyrics_scroll: 0,
+            lyrics_id: None,
             history: Vec::new(),
             hist_pos: None,
             count: None,
@@ -335,6 +357,7 @@ impl App {
     pub fn on_tick(&mut self) {
         self.tick = self.tick.wrapping_add(1);
         self.load_more();
+        self.sync_lyrics();
         if self.tick.is_multiple_of(50) {
             match self.save_session(false) {
                 Ok(()) => self.save_failed = false,
@@ -440,6 +463,7 @@ impl App {
             Mode::ConfirmDelete => self.key_confirm_delete(key),
             Mode::Menu => self.key_menu(key),
             Mode::Info => self.key_info(key),
+            Mode::Lyrics => self.key_lyrics(key),
             Mode::Normal => self.key_normal(key),
         }
     }
@@ -552,6 +576,8 @@ impl App {
                 self.cmd_search = false;
                 self.enter_command_mode();
             }
+            KeyCode::Char('L') => self.lyrics_panel = !self.lyrics_panel,
+            KeyCode::Char('F') => self.open_lyrics(),
             KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Esc => self.status = None,
@@ -764,6 +790,58 @@ impl App {
     fn key_info(&mut self, _key: KeyEvent) {
         self.mode = Mode::Normal;
         self.info_track = None;
+    }
+
+    fn open_lyrics(&mut self) {
+        self.mode = Mode::Lyrics;
+    }
+
+    fn key_lyrics(&mut self, key: KeyEvent) {
+        let scroll = self.lyrics_scroll;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'F' | 'L') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => self.lyrics_scroll = scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => self.lyrics_scroll = scroll.saturating_sub(1),
+            KeyCode::Char(' ') => self.toggle_pause(),
+            KeyCode::Char('n') | KeyCode::Char('>') => self.next(),
+            KeyCode::Char('N') | KeyCode::Char('<') => self.prev(),
+            KeyCode::Char('h') | KeyCode::Left => self.seek(Amount::Delta(-self.seek_step)),
+            KeyCode::Char('l') | KeyCode::Right => self.seek(Amount::Delta(self.seek_step)),
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                self.set_volume(Amount::Delta(self.volume_step))
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                self.set_volume(Amount::Delta(-self.volume_step))
+            }
+            _ => {}
+        }
+    }
+
+    fn sync_lyrics(&mut self) {
+        if !self.lyrics_panel && self.mode != Mode::Lyrics {
+            return;
+        }
+        let Some(track) = self
+            .now_track()
+            .filter(|_| self.play_state != PlayState::Stopped)
+            .cloned()
+        else {
+            return;
+        };
+        if self.lyrics_id.as_deref() == Some(track.id.as_str()) {
+            return;
+        }
+        self.lyrics_id = Some(track.id.clone());
+        self.lyrics = LyricsState::Loading;
+        self.lyrics_scroll = 0;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = lyrics::fetch(&track);
+            let _ = tx.send(AppEvent::Lyrics {
+                id: track.id,
+                result,
+            });
+        });
     }
 
     fn key_help(&mut self, key: KeyEvent) {
@@ -1000,6 +1078,7 @@ impl App {
             Command::AddTo(name) => self.add_to_playlist(&name),
             Command::Import(url) => self.start_import(url),
             Command::Artist => self.go_to_artist(),
+            Command::Lyrics => self.lyrics_panel = !self.lyrics_panel,
             Command::Help => self.open_help(),
         }
     }
@@ -1188,6 +1267,16 @@ impl App {
                         self.error(format!("Could not load more results: {e}"));
                     }
                 }
+            }
+            AppEvent::Lyrics { id, result } => {
+                if self.lyrics_id.as_deref() != Some(id.as_str()) {
+                    return;
+                }
+                self.lyrics = match result {
+                    Ok(Some(l)) => LyricsState::Ready(l),
+                    Ok(None) => LyricsState::Missing,
+                    Err(e) => LyricsState::Failed(e),
+                };
             }
             AppEvent::Player(generation, pe) => {
                 if generation == self.player_gen {
