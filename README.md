@@ -4,10 +4,11 @@
 
 [![Stars](https://img.shields.io/github/stars/socatlolmeow/drift?style=flat-square&logo=github)](https://github.com/socatlolmeow/drift/stargazers)
 ![License](https://img.shields.io/github/license/socatlolmeow/drift?style=flat-square)
+![Rust](https://img.shields.io/badge/built%20with-Rust-orange?style=flat-square&logo=rust)
 
-### A music streaming client using Vim keybinds built in Rust.
+### A YouTube Music player for your terminal, with Vim keybinds.
 
-Stream your favourite music from YouTube Music — all in one client, in your terminal.
+Search, queue and play music with no account, no login and no browser.
 
 </div>
 
@@ -21,18 +22,20 @@ Stream your favourite music from YouTube Music — all in one client, in your te
 
 ## Features
 
-- **YouTube Music streaming** - search and play tracks straight from YouTube Music, with no account or login
-- **Vim-style keybinds** - move with `j`/`k`, jump with `gg`/`ge`, use counts like `5j`, and open the command line with `:`
-- **Song context menu** - press `G` on any song for quick actions: play, queue, add to playlist, show artist, and song info
-- **Command palette** - a redesigned `:` prompt with the full command set (`:search`, `:seek`, `:vol`, `:import`, and more)
-- **Audio visualizer** - a live visualizer in the bottom-left corner while music plays
-- **Playlists & queue** - save, load, and reorder playlists, or import any YouTube / YouTube Music playlist by URL
-- **Artist browsing** - press `ga` to jump to an artist's songs
-- **Session restore** - your queue and playback position come back the next time you launch
-
----
+- **No login** - search and stream straight from YouTube Music
+- **Vim-style keybinds** - `j`/`k`, `gg`/`ge`, counts like `5j`, and `:` for the command line
+- **Synced lyrics** - a side panel or fullscreen view with the current line highlighted as it's sung
+- **Playlists & queue** - save, load and reorder playlists, or import any YouTube / YouTube Music playlist by URL
+- **Song menu** - press `G` on a song to play, queue, add to a playlist, jump to the artist or see its info
+- **Command palette** - `:search`, `:seek`, `:vol`, `:import` and more, with completion and history
+- **Artist browsing** - press `ga` to see an artist's songs
+- **Audio visualizer** - a live visualizer while music plays
+- **Session restore** - your queue and playback position come back on the next launch
+- **Configurable** - volume, seek step, repeat/shuffle defaults and accent color in a single TOML file
 
 ## Installation
+
+Drift needs [mpv](https://mpv.io/) for playback and [yt-dlp](https://github.com/yt-dlp/yt-dlp) for stream extraction. Run `drift --check` at any time to verify both are installed.
 
 ### Arch Linux (AUR)
 
@@ -40,7 +43,7 @@ Stream your favourite music from YouTube Music — all in one client, in your te
 yay -S driftmusic-git
 ```
 
-Any AUR helper works (`paru -S driftmusic-git`), or build it by hand:
+Any AUR helper works, or build it by hand:
 
 ```bash
 git clone https://aur.archlinux.org/driftmusic-git.git
@@ -50,37 +53,127 @@ makepkg -si
 
 `mpv` and `yt-dlp` are installed automatically.
 
-### Other distros
+### Install script
 
-Install the dependencies:
-
-- [mpv](https://mpv.io/) — audio playback
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — YouTube stream extraction
-- [Rust](https://rustup.rs/) (build only)
-
-Then build from source:
+On Arch, Debian/Ubuntu, Fedora and Void, the install script installs the dependencies and builds Drift with cargo:
 
 ```bash
 git clone https://github.com/socatlolmeow/drift.git
 cd drift
-cargo build --release
-sudo cp target/release/drift /usr/local/bin/
+./install.sh
 ```
 
-Or install directly with cargo:
+### From source
+
+Install the dependencies and [Rust](https://rustup.rs/), then:
 
 ```bash
+git clone https://github.com/socatlolmeow/drift.git
+cd drift
 cargo install --path .
 ```
 
-This installs `drift` to `~/.cargo/bin/`, which is on your `$PATH` if you installed Rust via [rustup](https://rustup.rs/).
+This puts `drift` in `~/.cargo/bin/`, which is on your `$PATH` if you installed Rust with rustup.
+
+<details>
+<summary>Installing mpv and yt-dlp manually</summary>
+
+| Platform | Command |
+| --- | --- |
+| Debian / Ubuntu | `sudo apt install mpv` and `pipx install yt-dlp` |
+| macOS | `brew install mpv yt-dlp` |
+| Arch | `sudo pacman -S mpv yt-dlp` |
+| Windows | `winget install mpv.net yt-dlp.yt-dlp` or `scoop install mpv yt-dlp` |
+
+</details>
+
+## Usage
+
+```bash
+drift                    # start the player
+drift "daft punk"        # start with a search
+drift --check            # verify mpv and yt-dlp are installed
+```
+
+Press `/` to search, `Enter` to play, `a` to queue and `?` for the full list of keybinds.
+
+## Keybinds
+
+| Key | Action |
+| --- | --- |
+| `j` `k` / `↓` `↑` | move (counts work: `5j`) |
+| `gg` `ge` | jump to top / bottom (`5gg` goes to row 5) |
+| `Tab` `Shift-Tab` | cycle Results / Queue / Playlists |
+| `gr` `gq` `gp` | jump to Results / Queue / Playlists |
+| `Enter` | play the selected song |
+| `Space` | pause / resume |
+| `n` `N` | next / previous track |
+| `h` `l` / `←` `→` | seek back / forward (counts: `6l`) |
+| `+` `-` | volume up / down |
+| `s` `r` | toggle shuffle / cycle repeat |
+| `a` `A` `P` | queue the song / queue all results / play all results |
+| `dd` `x` | remove from queue or playlist |
+| `J` `K` | move a queue or playlist item down / up |
+| `G` | song menu |
+| `ga` | go to the artist |
+| `L` | toggle the lyrics panel |
+| `F` | fullscreen lyrics |
+| `/` `:` | search / command line |
+| `?` | help |
+| `q` | quit |
+
+### Commands
+
+| Command | Action |
+| --- | --- |
+| `:search "query"` | search YouTube Music |
+| `:play [N]` | play or resume, or play row `N` |
+| `:seek 90` `1:30` `+10` | absolute or relative seek |
+| `:vol 50` `+5` | set or change the volume |
+| `:shuffle` `:repeat [off\|all\|one]` | playback modes |
+| `:add [N]` `:addall` `:playall` | queue results |
+| `:save name` `:load name` `:append name` | work with playlists |
+| `:addto name` `:delpl name` | add a song to / delete a playlist |
+| `:import URL` | import a YouTube / YouTube Music playlist |
+| `:lyrics` | toggle the lyrics panel |
+
+## Lyrics
+
+Press `L` for a side panel (needs a terminal at least 70 columns wide) or `F` for fullscreen. The current line is highlighted and fills in as it's sung. Songs without synced lyrics show plain text you can scroll with `j`/`k`.
+
+Lyrics come from [LRCLIB](https://lrclib.net) and are only fetched while the panel or fullscreen view is open.
+
+## Configuration
+
+Settings live in `config.toml` inside Drift's config directory (`~/.config/drift/` on Linux). Drift only reads the file and never rewrites it, so your comments are safe. Restart Drift after editing.
+
+```toml
+[playback]
+volume = 80
+shuffle = false
+repeat = "off"        # off, all or one
+autoplay = false
+restore_session = true
+seek_step = 5.0
+volume_step = 5.0
+
+[artist]
+popular_first = false
+
+[ui]
+accent = "cyan"       # a color name or a hex value like "#FF8800"
+```
+
+Set `DRIFT_CONFIG_DIR` or `DRIFT_STATE_DIR` to change where Drift keeps its config, playlists and session.
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) before you start.
 
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=socatlolmeow/drift&type=Date)](https://star-history.com/#socatlolmeow/drift)
 
----
-
 ## License
 
-[Drift](https://github.com/socatlolmeow/drift) is FOSS, released under the [GNU General Public License version 3 or later](https://www.gnu.org/licenses/gpl-3.0.html).
+[Drift](https://github.com/socatlolmeow/drift) is free software, released under the [GNU General Public License version 3 or later](https://www.gnu.org/licenses/gpl-3.0.html).
