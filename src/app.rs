@@ -9,7 +9,7 @@ use ratatui::widgets::TableState;
 use crate::command::{self, Amount, Command, COMMAND_NAMES};
 use crate::config::{self, Config};
 use crate::lyrics::{self, Lyrics};
-use crate::model::{fmt_time, split_artists, RepeatMode, Track};
+use crate::model::{split_artists, RepeatMode, Track};
 use crate::player::{Player, PlayerEvent};
 use crate::session::Session;
 use crate::store::Store;

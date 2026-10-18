@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Level, LyricsState, MenuAction, Mode, PlayState, View, NO_KEY};
