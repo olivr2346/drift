@@ -21,6 +21,14 @@ impl Track {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Collection {
+    pub browse_id: String,
+    pub title: String,
+    pub subtitle: String,
+    pub artist: String,
+}
+
 pub fn split_artists(credit: &str) -> Vec<String> {
     const MARK: char = '\u{1}';
     let mut s = credit.to_string();

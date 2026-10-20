@@ -9,11 +9,12 @@ use ratatui::widgets::TableState;
 use crate::command::{self, Amount, Command, COMMAND_NAMES};
 use crate::config::{self, Config};
 use crate::lyrics::{self, Lyrics};
-use crate::model::{split_artists, RepeatMode, Track};
+use crate::model::{split_artists, Collection, RepeatMode, Track};
+use crate::mpris::{Cmd, Mpris};
 use crate::player::{Player, PlayerEvent};
 use crate::session::Session;
 use crate::store::Store;
-use crate::ytmusic::{self, Page};
+use crate::ytmusic::{self, Kind, Page};
 
 pub enum AppEvent {
     Player(u64, PlayerEvent),
@@ -30,6 +31,12 @@ pub enum AppEvent {
         id: String,
         result: Result<Option<Lyrics>, String>,
     },
+    Collections {
+        id: u64,
+        title: String,
+        result: Result<Vec<Collection>, String>,
+    },
+    Media(Cmd),
 }
 
 const FIRST_PAGE: usize = 20;
@@ -61,6 +68,7 @@ pub enum Mode {
     Normal,
     Command,
     ArtistPick,
+    CollectionPick,
     ConfirmDelete,
     Help,
     Menu,
@@ -99,6 +107,8 @@ pub enum MenuAction {
     PlayNext,
     Queue,
     Artist,
+    Similar,
+    Album,
     PlaylistMenu,
     PickPlaylist(String),
     NewPlaylist,
@@ -166,6 +176,9 @@ pub struct App {
     pub artist_opts: Vec<String>,
     pub info_track: Option<Track>,
     pub artist_sel: usize,
+    pub picks: Vec<Collection>,
+    pub pick_sel: usize,
+    pub pick_title: String,
     pub pending_delete: Option<String>,
     pub help_scroll: usize,
     pub lyrics: LyricsState,
@@ -185,6 +198,8 @@ pub struct App {
     pub repeat: RepeatMode,
     pub accent: ratatui::style::Color,
     played: HashSet<usize>,
+    radio_played: HashSet<usize>,
+    resume_radio: bool,
     fail_streak: u8,
     result_cursor: Option<usize>,
     buffered: Vec<Track>,
@@ -193,6 +208,8 @@ pub struct App {
     results_gen: u64,
     radio: Vec<Track>,
     on_radio: bool,
+    similar_load: Option<u64>,
+    mpris: Option<Mpris>,
     seek_step: f64,
     volume_step: f64,
     autoplay: bool,
@@ -225,6 +242,12 @@ impl App {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9E37_79B9_7F4A_7C15)
             | 1;
+        let mpris = {
+            let t = tx.clone();
+            Mpris::new(move |c| {
+                let _ = t.send(AppEvent::Media(c));
+            })
+        };
         let mut app = App {
             view: View::Results,
             mode: Mode::Normal,
@@ -248,6 +271,9 @@ impl App {
             artist_opts: Vec::new(),
             info_track: None,
             artist_sel: 0,
+            picks: Vec::new(),
+            pick_sel: 0,
+            pick_title: String::new(),
             pending_delete: None,
             help_scroll: 0,
             lyrics: LyricsState::Idle,
@@ -266,6 +292,8 @@ impl App {
             repeat: p.repeat,
             accent: cfg.ui.accent,
             played: HashSet::new(),
+            radio_played: HashSet::new(),
+            resume_radio: false,
             fail_streak: 0,
             result_cursor: None,
             buffered: Vec::new(),
@@ -274,6 +302,8 @@ impl App {
             results_gen: 0,
             radio: Vec::new(),
             on_radio: false,
+            similar_load: None,
+            mpris,
             seek_step: p.seek_step,
             volume_step: p.volume_step,
             autoplay: p.autoplay,
@@ -315,6 +345,7 @@ impl App {
             eprintln!("drift: could not save session: {e:#}");
         }
         self.player = None;
+        self.mpris = None;
     }
 
     fn save_session(&mut self, force: bool) -> Result<()> {
@@ -358,6 +389,7 @@ impl App {
         self.tick = self.tick.wrapping_add(1);
         self.load_more();
         self.sync_lyrics();
+        self.sync_mpris();
         if self.tick.is_multiple_of(50) {
             match self.save_session(false) {
                 Ok(()) => self.save_failed = false,
@@ -460,6 +492,7 @@ impl App {
             Mode::Help => self.key_help(key),
             Mode::Command => self.key_command(key),
             Mode::ArtistPick => self.key_artist_pick(key),
+            Mode::CollectionPick => self.key_collection_pick(key),
             Mode::ConfirmDelete => self.key_confirm_delete(key),
             Mode::Menu => self.key_menu(key),
             Mode::Info => self.key_info(key),
@@ -484,6 +517,8 @@ impl App {
                     ('g', 'p') => self.set_view(View::Playlists),
                     ('d', 'd') => self.delete_selected(),
                     ('g', 'a') => self.go_to_artist(),
+                    ('g', 's') => self.go_similar(),
+                    ('g', 'b') => self.go_album(),
                     _ => {}
                 }
             }
@@ -626,6 +661,10 @@ impl App {
                 items.push(menu_item('a', "Add to queue", MenuAction::Queue));
             }
             items.push(menu_item('g', "Show artist", MenuAction::Artist));
+            items.push(menu_item('s', "Similar songs", MenuAction::Similar));
+            if track.album.is_some() {
+                items.push(menu_item('b', "Show album", MenuAction::Album));
+            }
             items.push(menu_item('l', "Add to playlist…", MenuAction::PlaylistMenu));
             if in_queue {
                 items.push(menu_item('x', "Remove from queue", MenuAction::Remove));
@@ -741,6 +780,8 @@ impl App {
             }
             MenuAction::Queue | MenuAction::AppendPlaylist => self.add_selected(),
             MenuAction::Artist => self.go_to_artist(),
+            MenuAction::Similar => self.go_similar(),
+            MenuAction::Album => self.go_album(),
             MenuAction::PlaylistMenu => {}
             MenuAction::PickPlaylist(name) => self.add_to_playlist(&name),
             MenuAction::NewPlaylist => self.prefill_command("addto "),
@@ -1078,6 +1119,10 @@ impl App {
             Command::AddTo(name) => self.add_to_playlist(&name),
             Command::Import(url) => self.start_import(url),
             Command::Artist => self.go_to_artist(),
+            Command::Similar => self.go_similar(),
+            Command::Album(Some(q)) => self.start_collection_search(q, Kind::Album),
+            Command::Album(None) => self.go_album(),
+            Command::PlaylistSearch(q) => self.start_collection_search(q, Kind::Playlist),
             Command::Lyrics => self.lyrics_panel = !self.lyrics_panel,
             Command::Help => self.open_help(),
         }
@@ -1182,6 +1227,127 @@ impl App {
         });
     }
 
+    fn go_album(&mut self) {
+        let Some(track) = self.artist_target() else {
+            return self.error("No song selected");
+        };
+        let Some(album) = track.album.clone() else {
+            return self.error("No album known for this song");
+        };
+        let artist = split_artists(&track.artist)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let busy = format!("Loading album \u{201c}{album}\u{201d}");
+        let title = format!("Album: {album}");
+        self.spawn_loader(title, busy, move || {
+            let found = ytmusic::search_collections(&format!("{album} {artist}"), Kind::Album)?;
+            let want = album.to_lowercase();
+            let pick = found
+                .iter()
+                .find(|c| c.title.to_lowercase() == want)
+                .or(found.first())
+                .ok_or_else(|| "album not found".to_string())?;
+            ytmusic::browse_tracks(&pick.browse_id, &pick.title, &pick.artist).map(Page::from)
+        });
+    }
+
+    fn start_collection_search(&mut self, query: String, kind: Kind) {
+        let (what, title) = match kind {
+            Kind::Album => ("albums", format!("Albums: {query}")),
+            Kind::Playlist => ("playlists", format!("Playlists: {query}")),
+        };
+        self.search_id += 1;
+        let id = self.search_id;
+        self.busy = Some(format!("Searching {what} for \u{201c}{query}\u{201d}"));
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = ytmusic::search_collections(&query, kind);
+            let _ = tx.send(AppEvent::Collections { id, title, result });
+        });
+    }
+
+    fn key_collection_pick(&mut self, key: KeyEvent) {
+        let len = self.picks.len();
+        if len == 0 {
+            self.mode = Mode::Normal;
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_collection_pick(),
+            KeyCode::Char('j') | KeyCode::Down => self.pick_sel = (self.pick_sel + 1).min(len - 1),
+            KeyCode::Char('k') | KeyCode::Up => self.pick_sel = self.pick_sel.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => self.pick_sel = 0,
+            KeyCode::Char('G') | KeyCode::End => self.pick_sel = len - 1,
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = c as usize - '1' as usize;
+                if i < len {
+                    self.pick_sel = i;
+                    self.confirm_collection();
+                }
+            }
+            KeyCode::Enter => self.confirm_collection(),
+            _ => {}
+        }
+    }
+
+    fn close_collection_pick(&mut self) {
+        self.mode = Mode::Normal;
+        self.picks.clear();
+        self.pick_sel = 0;
+    }
+
+    fn confirm_collection(&mut self) {
+        let c = self.picks.get(self.pick_sel).cloned();
+        self.close_collection_pick();
+        let Some(c) = c else { return };
+        let kind = if c.browse_id.starts_with("VL") { "Playlist" } else { "Album" };
+        let busy = format!("Loading \u{201c}{}\u{201d}", c.title);
+        let title = format!("{kind}: {}", c.title);
+        self.spawn_loader(title, busy, move || {
+            ytmusic::browse_tracks(&c.browse_id, &c.title, &c.artist).map(Page::from)
+        });
+    }
+
+    fn on_media(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Play => match self.play_state {
+                PlayState::Stopped => self.play_default(),
+                _ => self.set_pause(false),
+            },
+            Cmd::Pause => {
+                if self.play_state != PlayState::Stopped {
+                    self.set_pause(true);
+                }
+            }
+            Cmd::Toggle => self.toggle_pause(),
+            Cmd::Stop => self.stop_playback(),
+            Cmd::Next => self.next(),
+            Cmd::Prev => self.prev(),
+            Cmd::SeekBy(d) => self.seek(Amount::Delta(d)),
+            Cmd::SeekTo(p) => self.seek(Amount::Abs(p)),
+            Cmd::Quit => self.should_quit = true,
+        }
+    }
+
+    fn sync_mpris(&mut self) {
+        if let Some(mut m) = self.mpris.take() {
+            m.update(self.now_track(), self.play_state, self.position);
+            self.mpris = Some(m);
+        }
+    }
+
+    fn go_similar(&mut self) {
+        let Some(track) = self.artist_target() else {
+            return self.error("No song selected");
+        };
+        let busy = format!("Finding songs like \u{201c}{}\u{201d}", track.title);
+        let title = format!("Similar to {}", track.title);
+        let id = track.id;
+        self.spawn_loader(title, busy, move || ytmusic::radio(&id).map(Page::from));
+        self.similar_load = Some(self.search_id);
+    }
+
     fn start_search(&mut self, query: String) {
         self.spawn_loader(
             format!("Search: {query}"),
@@ -1219,6 +1385,7 @@ impl App {
                     return;
                 }
                 self.busy = None;
+                let autoplay = self.similar_load.take() == Some(id);
                 match result {
                     Ok(page) if page.tracks.is_empty() => self.info("No results found."),
                     Ok(page) => {
@@ -1236,6 +1403,9 @@ impl App {
                         self.states[View::Results.idx()].select(Some(0));
                         self.set_view(View::Results);
                         self.info(format!("{n} results — Enter plays, a queues, ? for help"));
+                        if autoplay {
+                            self.play_result(0);
+                        }
                     }
                     Err(e) => self.error(e),
                 }
@@ -1268,6 +1438,23 @@ impl App {
                     }
                 }
             }
+            AppEvent::Collections { id, title, result } => {
+                if id != self.search_id {
+                    return;
+                }
+                self.busy = None;
+                match result {
+                    Ok(list) if list.is_empty() => self.info("Nothing found."),
+                    Ok(list) => {
+                        self.picks = list;
+                        self.pick_sel = 0;
+                        self.pick_title = title;
+                        self.mode = Mode::CollectionPick;
+                    }
+                    Err(e) => self.error(e),
+                }
+            }
+            AppEvent::Media(cmd) => self.on_media(cmd),
             AppEvent::Lyrics { id, result } => {
                 if self.lyrics_id.as_deref() != Some(id.as_str()) {
                     return;
@@ -1456,6 +1643,7 @@ impl App {
         } else {
             self.current.unwrap_or(0)
         };
+        self.resume_radio = false;
         self.start_track(i.min(self.queue.len() - 1), true);
     }
 
@@ -1473,6 +1661,7 @@ impl App {
             }
             View::Queue => {
                 if i < self.queue.len() {
+                    self.resume_radio = false;
                     self.play_index(i);
                 }
             }
@@ -1482,7 +1671,7 @@ impl App {
                         self.play_playlist_from(&name, i);
                     }
                 } else if let Some(name) = self.playlist_name(i) {
-                    self.load_playlist(&name, true);
+                    self.play_playlist_from(&name, 0);
                 }
             }
         }
@@ -1493,6 +1682,7 @@ impl App {
             return;
         }
         self.radio = self.results.clone();
+        self.radio_played.clear();
         self.play_radio(i);
     }
 
@@ -1501,7 +1691,9 @@ impl App {
             return;
         };
         self.on_radio = true;
+        self.resume_radio = true;
         self.result_cursor = Some(i);
+        self.radio_played.insert(i);
         self.resume = None;
         self.play_state = PlayState::Loading;
         self.position = 0.0;
@@ -1604,11 +1796,12 @@ impl App {
         }
 
         let len = self.queue.len();
+        let wrap = self.repeat == RepeatMode::All && !(self.on_radio || self.resume_radio);
         let next = if len == 0 {
             None
         } else if self.shuffle {
             let mut pool: Vec<usize> = (0..len).filter(|i| !self.played.contains(i)).collect();
-            if pool.is_empty() && self.repeat == RepeatMode::All {
+            if pool.is_empty() && wrap {
                 self.played.clear();
                 pool = (0..len).filter(|i| Some(*i) != self.current).collect();
                 if pool.is_empty() {
@@ -1624,7 +1817,7 @@ impl App {
         } else {
             match self.current {
                 Some(c) if c + 1 < len => Some(c + 1),
-                Some(_) if self.repeat == RepeatMode::All => Some(0),
+                Some(_) if wrap => Some(0),
                 Some(_) => None,
                 None => Some(0),
             }
@@ -1636,19 +1829,43 @@ impl App {
     }
 
     fn advance_radio(&mut self, auto: bool) {
-        let next = self
+        let cursor = self
             .result_cursor
-            .filter(|_| self.on_radio || self.autoplay)
-            .map(|c| c + 1)
-            .filter(|&i| i < self.radio.len());
-        match next {
+            .filter(|_| self.on_radio || self.resume_radio || self.autoplay);
+        match cursor.and_then(|c| self.next_in_radio(c)) {
             Some(i) => self.play_radio(i),
             None if auto => {
                 self.stop_playback();
-                self.info("Queue finished");
+                self.info("Finished playing");
             }
-            None => self.info("End of queue"),
+            None => self.info("End of the list"),
         }
+    }
+
+    fn next_in_radio(&mut self, cursor: usize) -> Option<usize> {
+        let len = self.radio.len();
+        if !self.shuffle {
+            return match cursor + 1 {
+                n if n < len => Some(n),
+                _ if self.repeat == RepeatMode::All && len > 0 => Some(0),
+                _ => None,
+            };
+        }
+        let mut pool: Vec<usize> = (0..len)
+            .filter(|i| !self.radio_played.contains(i))
+            .collect();
+        if pool.is_empty() && self.repeat == RepeatMode::All {
+            self.radio_played.clear();
+            pool = (0..len).filter(|&i| i != cursor).collect();
+            if pool.is_empty() {
+                pool = vec![cursor];
+            }
+        }
+        if pool.is_empty() {
+            return None;
+        }
+        let k = self.rand_below(pool.len());
+        Some(pool[k])
     }
 
     fn seek(&mut self, amount: Amount) {
@@ -1691,6 +1908,10 @@ impl App {
         self.played.clear();
         if let Some(c) = self.current {
             self.played.insert(c);
+        }
+        self.radio_played.clear();
+        if let Some(c) = self.result_cursor {
+            self.radio_played.insert(c);
         }
         self.info(format!(
             "Shuffle: {}",
@@ -1754,11 +1975,7 @@ impl App {
         } else {
             0
         };
-        self.queue = self.results.clone();
-        self.played.clear();
-        self.current = None;
-        self.result_cursor = None;
-        self.play_index(start.min(self.queue.len() - 1));
+        self.play_result(start.min(self.results.len() - 1));
     }
 
     fn clear_queue(&mut self) {
@@ -1909,6 +2126,7 @@ impl App {
             self.played.clear();
             self.current = None;
             self.result_cursor = None;
+            self.resume_radio = false;
             self.states[View::Queue.idx()].select(Some(0));
             self.play_index(0);
             self.info(format!(
@@ -1943,12 +2161,9 @@ impl App {
             return self.error(format!("Playlist \u{201c}{name}\u{201d} is empty"));
         }
         let i = i.min(tracks.len() - 1);
-        self.queue = tracks;
-        self.played.clear();
-        self.current = None;
-        self.result_cursor = None;
-        self.states[View::Queue.idx()].select(Some(i));
-        self.play_index(i);
+        self.radio = tracks;
+        self.radio_played.clear();
+        self.play_radio(i);
     }
 
     fn remove_playlist_track(&mut self, i: usize) {
@@ -2080,6 +2295,61 @@ mod tests {
         assert_eq!(app.results.len(), 25);
     }
 
+    fn now_title(app: &App) -> Option<&str> {
+        app.now_track().map(|t| t.title.as_str())
+    }
+
+    fn check_playlist_playback(app: &mut App) {
+        app.queue.clear();
+        app.current = None;
+        app.played.clear();
+        app.store.playlists.insert(
+            "run".into(),
+            vec![
+                track("rrrrrrrrrr1", "R1"),
+                track("rrrrrrrrrr2", "R2"),
+                track("rrrrrrrrrr3", "R3"),
+            ],
+        );
+
+        app.set_view(View::Playlists);
+        app.open = Some("run".into());
+        app.pl_state.select(Some(0));
+        press(app, KeyCode::Enter);
+        assert!(app.queue.is_empty());
+        assert_eq!(now_title(app), Some("R1"));
+
+        app.enqueue(track("qqqqqqqqqq1", "Q1"));
+        app.advance(true);
+        assert_eq!(now_title(app), Some("Q1"));
+        app.advance(true);
+        assert_eq!(now_title(app), Some("R2"));
+        app.advance(true);
+        assert_eq!(now_title(app), Some("R3"));
+        assert_eq!(app.queue.len(), 1);
+
+        app.repeat = RepeatMode::All;
+        app.advance(true);
+        assert_eq!(now_title(app), Some("R1"));
+        app.repeat = RepeatMode::Off;
+
+        app.open = None;
+        let i = app.store.playlists.keys().position(|k| k == "run").unwrap();
+        app.activate_at(View::Playlists, i);
+        assert_eq!(now_title(app), Some("R1"));
+        assert_eq!(app.queue.len(), 1);
+
+        app.shuffle = true;
+        app.advance(true);
+        let first = app.result_cursor.unwrap();
+        app.advance(true);
+        let second = app.result_cursor.unwrap();
+        assert!(first != 0 && second != 0 && first != second);
+        app.advance(true);
+        assert_eq!(app.result_cursor, Some(second));
+        app.shuffle = false;
+    }
+
     #[test]
     fn playlist_drill_in() {
         let dir = std::env::temp_dir().join(format!("drift-test-{}", std::process::id()));
@@ -2173,6 +2443,8 @@ mod tests {
 
         app.run_command("remove");
         assert_eq!(app.queue.len(), 1);
+
+        check_playlist_playback(&mut app);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

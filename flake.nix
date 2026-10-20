@@ -11,7 +11,7 @@
         in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "drift";
-            version = "0.1.0";
+            version = "1.3";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.makeWrapper ];

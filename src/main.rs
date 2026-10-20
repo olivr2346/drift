@@ -3,6 +3,7 @@ mod command;
 mod config;
 mod lyrics;
 mod model;
+mod mpris;
 mod player;
 mod session;
 mod store;
@@ -128,6 +129,12 @@ fn run(initial_query: Option<String>) -> Result<()> {
     }
 
     let mut terminal = ratatui::try_init()?;
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            hook(info);
+        }
+    }));
     let result = event_loop(&mut terminal, &mut app, &rx);
     ratatui::restore();
     app.shutdown();

@@ -4,14 +4,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::model::{is_valid_id, parse_clock, Track};
+use crate::model::{is_valid_id, parse_clock, Collection, Track};
 
 const ENDPOINT: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
 const BROWSE_ENDPOINT: &str = "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false";
+const NEXT_ENDPOINT: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
+const ALBUMS_FILTER: &str = "EgWKAQIYAWoMEA4QChADEAQQCRAF";
+const PLAYLISTS_FILTER: &str = "Eg-KAQwIABAAGAAgACgBMABqChAEEAMQCRAFEAo%3D";
+const RADIO_TARGET: usize = 50;
+const RADIO_PAGES: usize = 4;
 const SONGS_FILTER: &str = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
 const ARTISTS_FILTER: &str = "EgWKAQIgAWoMEA4QChADEAQQCRAF";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 const FALLBACK_COUNT: usize = 25;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Album,
+    Playlist,
+}
 
 pub struct Page {
     pub tracks: Vec<Track>,
@@ -47,6 +58,91 @@ pub fn search_more(token: &str) -> Result<Page, String> {
     post(&url, json!({}))
         .map(|v| page_from(&v))
         .map_err(|e| format!("{e:#}"))
+}
+
+pub fn search_collections(query: &str, kind: Kind) -> Result<Vec<Collection>, String> {
+    let params = match kind {
+        Kind::Album => ALBUMS_FILTER,
+        Kind::Playlist => PLAYLISTS_FILTER,
+    };
+    post(ENDPOINT, json!({ "query": query, "params": params }))
+        .map(|v| parse_collections(&v, kind))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/* browse_id: MPREb_... for an album, VL... for a playlist */
+pub fn browse_tracks(browse_id: &str, album: &str, artist: &str) -> Result<Vec<Track>, String> {
+    let playlist = browse_id.starts_with("VL");
+    let v = post(BROWSE_ENDPOINT, json!({ "browseId": browse_id })).map_err(|e| format!("{e:#}"))?;
+    let mut tracks = parse_browse(&v, playlist);
+    let mut next = if playlist { find_continuation(&v) } else { None };
+    let mut pages = 0;
+    while let Some(tok) = next.take() {
+        if pages >= 5 || tracks.len() >= 300 {
+            break;
+        }
+        pages += 1;
+        let url = format!("{BROWSE_ENDPOINT}&ctoken={tok}&continuation={tok}");
+        let Ok(v) = post(&url, json!({})) else { break };
+        let more = parse_browse(&v, true);
+        if more.is_empty() {
+            break;
+        }
+        let known: std::collections::HashSet<String> =
+            tracks.iter().map(|t| t.id.clone()).collect();
+        tracks.extend(more.into_iter().filter(|t| !known.contains(&t.id)));
+        next = find_continuation(&v);
+    }
+    if tracks.is_empty() {
+        return Err("nothing playable found".into());
+    }
+    if !playlist {
+        for t in &mut tracks {
+            if !album.is_empty() && t.album.is_none() {
+                t.album = Some(album.to_string());
+            }
+            if !artist.is_empty() && t.artist == "Unknown artist" {
+                t.artist = artist.to_string();
+            }
+        }
+    }
+    Ok(tracks)
+}
+
+pub fn radio(seed: &str) -> Result<Vec<Track>, String> {
+    fetch_radio(seed).map_err(|e| format!("{e:#}"))
+}
+
+fn fetch_radio(seed: &str) -> Result<Vec<Track>> {
+    let body = json!({
+        "videoId": seed,
+        "playlistId": format!("RDAMVM{seed}"),
+        "params": "wAEB",
+        "isAudioOnly": true,
+        "enablePersistentPlaylistPanel": true,
+        "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+    });
+    let mut url = NEXT_ENDPOINT.to_string();
+    let mut tracks: Vec<Track> = Vec::new();
+    for _ in 0..RADIO_PAGES {
+        let v = post(&url, body.clone())?;
+        let before = tracks.len();
+        for t in parse_radio_response(&v) {
+            if !tracks.iter().any(|x| x.id == t.id) {
+                tracks.push(t);
+            }
+        }
+        match find_continuation(&v) {
+            Some(tok) if tracks.len() < RADIO_TARGET && tracks.len() > before => {
+                url = format!("{NEXT_ENDPOINT}&ctoken={tok}&continuation={tok}");
+            }
+            _ => break,
+        }
+    }
+    if tracks.is_empty() {
+        bail!("no similar songs found");
+    }
+    Ok(tracks)
 }
 
 pub fn import(url: &str) -> Result<Vec<Track>, String> {
@@ -119,6 +215,7 @@ fn find_continuation(v: &Value) -> Option<String> {
         Value::Object(map) => {
             let token = map
                 .get("nextContinuationData")
+                .or_else(|| map.get("nextRadioContinuationData"))
                 .and_then(|c| c.get("continuation"))
                 .or_else(|| {
                     map.get("continuationCommand")
@@ -220,11 +317,15 @@ fn find_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn column_segments(item: &Value, col: usize) -> Vec<String> {
-    let runs = item
-        .get("flexColumns")
-        .and_then(|c| c.get(col))
-        .and_then(|c| c.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
-        .and_then(Value::as_array);
+    run_segments(
+        item.get("flexColumns")
+            .and_then(|c| c.get(col))
+            .and_then(|c| c.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
+            .and_then(Value::as_array),
+    )
+}
+
+fn run_segments(runs: Option<&Vec<Value>>) -> Vec<String> {
     let mut segments = Vec::new();
     let mut cur = String::new();
     for run in runs.into_iter().flatten() {
@@ -249,6 +350,13 @@ fn looks_like_duration(s: &str) -> bool {
     s.contains(':') && s.chars().all(|c| c.is_ascii_digit() || c == ':')
 }
 
+fn fixed_duration(item: &Value) -> Option<u32> {
+    let s = item
+        .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs/0/text")?
+        .as_str()?;
+    parse_clock(s).map(|s| s as u32)
+}
+
 fn parse_item(item: &Value) -> Option<Track> {
     let id = find_str(item, "videoId")?;
     if !is_valid_id(id) {
@@ -271,6 +379,7 @@ fn parse_item(item: &Value) -> Option<Track> {
         }
         _ => None,
     };
+    let duration = duration.or_else(|| fixed_duration(item));
     let artist = meta
         .first()
         .cloned()
@@ -289,6 +398,63 @@ fn parse_item(item: &Value) -> Option<Track> {
     })
 }
 
+fn parse_browse(v: &Value, playlist: bool) -> Vec<Track> {
+    let mut items = Vec::new();
+    collect_items(v, &mut items);
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let mut t = parse_item(item)?;
+            if playlist && t.album.is_none() {
+                t.album = column_segments(item, 2).into_iter().next();
+            }
+            Some(t)
+        })
+        .filter(|t| seen.insert(t.id.clone()))
+        .collect()
+}
+
+pub fn parse_collections(v: &Value, kind: Kind) -> Vec<Collection> {
+    let mut items = Vec::new();
+    collect_items(v, &mut items);
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter_map(|item| {
+            let id = item
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")?
+                .as_str()?;
+            let ok = match kind {
+                Kind::Album => id.starts_with("MPRE"),
+                Kind::Playlist => id.starts_with("VL"),
+            };
+            if !ok {
+                return None;
+            }
+            let title = column_segments(item, 0).into_iter().next()?;
+            let mut meta = column_segments(item, 1);
+            if matches!(
+                meta.first().map(String::as_str),
+                Some("Album" | "EP" | "Single" | "Playlist")
+            ) {
+                meta.remove(0);
+            }
+            let artist = match kind {
+                Kind::Album => meta.first().cloned().unwrap_or_default(),
+                Kind::Playlist => String::new(),
+            };
+            Some(Collection {
+                browse_id: id.to_string(),
+                title,
+                subtitle: meta.join(" · "),
+                artist,
+            })
+        })
+        .filter(|c| seen.insert(c.browse_id.clone()))
+        .collect()
+}
+
 pub fn parse_search_response(v: &Value) -> Vec<Track> {
     let mut items = Vec::new();
     collect_items(v, &mut items);
@@ -296,6 +462,76 @@ pub fn parse_search_response(v: &Value) -> Vec<Track> {
     items
         .into_iter()
         .filter_map(parse_item)
+        .filter(|t| seen.insert(t.id.clone()))
+        .collect()
+}
+
+fn collect_panel<'a>(v: &'a Value, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(map) => {
+            if let Some(w) = map.get("playlistPanelVideoWrapperRenderer") {
+                out.extend(w.pointer("/primaryRenderer/playlistPanelVideoRenderer"));
+            } else if let Some(item) = map.get("playlistPanelVideoRenderer") {
+                out.push(item);
+            } else {
+                map.values().for_each(|c| collect_panel(c, out));
+            }
+        }
+        Value::Array(arr) => arr.iter().for_each(|c| collect_panel(c, out)),
+        _ => {}
+    }
+}
+
+fn parse_panel_item(item: &Value) -> Option<Track> {
+    let id = item.get("videoId")?.as_str()?;
+    if !is_valid_id(id) {
+        return None;
+    }
+    let title: String = item
+        .pointer("/title/runs")?
+        .as_array()?
+        .iter()
+        .filter_map(|r| r.get("text")?.as_str())
+        .collect();
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    let meta = run_segments(item.pointer("/longBylineText/runs").and_then(Value::as_array));
+    let artist = meta
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Unknown artist".into());
+    let album = meta
+        .get(1)
+        .filter(|a| {
+            !a.contains(" views")
+                && !a.contains(" plays")
+                && !(a.len() == 4 && a.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .cloned();
+    let duration = item
+        .pointer("/lengthText/runs/0/text")
+        .or_else(|| item.pointer("/lengthText/simpleText"))
+        .and_then(Value::as_str)
+        .and_then(parse_clock)
+        .map(|s| s as u32);
+    Some(Track {
+        id: id.to_string(),
+        title,
+        artist,
+        album,
+        duration,
+    })
+}
+
+pub fn parse_radio_response(v: &Value) -> Vec<Track> {
+    let mut items = Vec::new();
+    collect_panel(v, &mut items);
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter_map(parse_panel_item)
         .filter(|t| seen.insert(t.id.clone()))
         .collect()
 }
@@ -461,6 +697,76 @@ not json
         }}}]);
         assert_eq!(find_continuation(&new).as_deref(), Some("def"));
         assert_eq!(find_continuation(&json!({"a": [1, 2]})), None);
+    }
+
+    #[test]
+    fn parses_radio_panel() {
+        let item = |id: &str, title: &str, by: Value, len: &str| {
+            json!({"playlistPanelVideoRenderer": {
+                "videoId": id,
+                "title": {"runs": [{"text": title}]},
+                "longBylineText": {"runs": by},
+                "lengthText": {"runs": [{"text": len}]},
+            }})
+        };
+        let by = json!([{"text": "A"}, {"text": " & "}, {"text": "B"},
+            {"text": " • "}, {"text": "Album"}, {"text": " • "}, {"text": "2019"}]);
+        let resp = json!({"contents": [
+            item("abcdefghijk", "One", by, "3:21"),
+            {"playlistPanelVideoWrapperRenderer": {
+                "primaryRenderer": item("bcdefghijkl", "Two", json!([{"text": "C"}]), "1:05"),
+                "counterpart": [item("zzzzzzzzzzz", "Video", json!([{"text": "C"}]), "1:05")],
+            }},
+            item("abcdefghijk", "dup", json!([{"text": "A"}]), "3:21"),
+        ]});
+        let t = parse_radio_response(&resp);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].artist, "A & B");
+        assert_eq!(t[0].album.as_deref(), Some("Album"));
+        assert_eq!(t[0].duration, Some(201));
+        assert_eq!(t[1].id, "bcdefghijkl");
+        assert_eq!(t[1].album, None);
+    }
+
+    #[test]
+    fn parses_album_and_playlist_results() {
+        let row = |id: &str, title: &str, runs: Value| {
+            json!({"musicResponsiveListItemRenderer": {
+                "navigationEndpoint": {"browseEndpoint": {"browseId": id}},
+                "flexColumns": [
+                    {"musicResponsiveListItemFlexColumnRenderer": run(title)},
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": runs}}},
+                ]
+            }})
+        };
+        let resp = json!([
+            row("MPREb_abc", "Discovery", json!([{"text": "Album"}, {"text": " • "},
+                {"text": "Daft Punk"}, {"text": " • "}, {"text": "2001"}])),
+            row("VLPL123", "Mix", json!([{"text": "Playlist"}, {"text": " • "}, {"text": "Someone"}])),
+            row("UCartist", "Artist", json!([{"text": "Artist"}])),
+        ]);
+        let a = parse_collections(&resp, Kind::Album);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].title, "Discovery");
+        assert_eq!(a[0].artist, "Daft Punk");
+        assert_eq!(a[0].subtitle, "Daft Punk · 2001");
+        let p = parse_collections(&resp, Kind::Playlist);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].browse_id, "VLPL123");
+        assert_eq!(p[0].artist, "");
+    }
+
+    #[test]
+    fn parses_browse_tracks() {
+        let resp = json!({"contents": [{"musicResponsiveListItemRenderer": {
+            "playlistItemData": {"videoId": "abcdefghijk"},
+            "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": run("One More Time")}],
+            "fixedColumns": [{"musicResponsiveListItemFixedColumnRenderer": run("5:20")}],
+        }}]});
+        let t = parse_browse(&resp, false);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].duration, Some(320));
+        assert_eq!(t[0].artist, "Unknown artist");
     }
 
     #[test]

@@ -69,6 +69,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.mode == Mode::ArtistPick {
         draw_artist_picker(f, app, area);
     }
+    if app.mode == Mode::CollectionPick {
+        draw_collection_picker(f, app, area);
+    }
     if app.mode == Mode::Info {
         draw_info(f, app, area);
     }
@@ -801,6 +804,9 @@ const CMD_INFO: &[(&str, &str)] = &[
     ("addto", "add the selected track to a playlist"),
     ("import", "import a YouTube / YT Music playlist URL"),
     ("artist", "songs by the selected artist"),
+    ("similar", "radio: songs similar to the selected one"),
+    ("album", "open the selected song's album, or :album <query> to search"),
+    ("playlist", "search YouTube Music playlists"),
     ("lyrics", "show or hide the lyrics panel"),
     ("help", "show key bindings"),
 ];
@@ -1075,10 +1081,19 @@ const HELP: &[(&str, &str)] = &[
         "ga  or  :artist",
         "songs by the artist of the selected song; a popup asks which one when there are several",
     ),
+    (
+        "gb  or  :album",
+        "open the album of the selected song; :album <query> searches albums",
+    ),
+    (":playlist <query>", "search YouTube Music playlists (pick one, then ⏎)"),
+    (
+        "gs  or  :similar",
+        "radio: load songs similar to the selected one and start playing them",
+    ),
     ("SONG MENU  ( G )", "#"),
     ("G", "menu for the highlighted song or playlist"),
     ("j k  ⏎", "move / choose (the yellow letter is a shortcut)"),
-    ("p n a g l", "play · play next · add to queue · artist · playlist"),
+    ("p n a g s b l", "play · next · queue · artist · similar · album · playlist"),
     ("x i", "remove · song info"),
     ("Esc  q  G", "close (Esc goes back from a sub-menu)"),
     ("QUEUE", "#"),
@@ -1116,6 +1131,8 @@ const HELP: &[(&str, &str)] = &[
     (":addto n", "add the selected track to playlist n"),
     (":import URL", "load a YouTube / YT Music playlist"),
     (":artist", "same as ga"),
+    (":similar", "same as gs (also :radio)"),
+    (":album [q]", "same as gb, or search albums"),
     (":lyrics", "same as L"),
     (":quit  (or q, Ctrl-c)", ""),
 ];
@@ -1213,6 +1230,55 @@ fn draw_artist_picker(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Go to which artist? ")
+                .border_style(Style::new().fg(Color::Yellow)),
+        ),
+        popup,
+    );
+}
+
+fn draw_collection_picker(f: &mut Frame, app: &App, area: Rect) {
+    let n = app.picks.len();
+    let w = area.width.min(78);
+    let h = (n as u16).saturating_add(3).min(area.height);
+    let visible = h.saturating_sub(3) as usize;
+    let start = if app.pick_sel < visible {
+        0
+    } else {
+        app.pick_sel + 1 - visible
+    };
+    let popup = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    };
+    let inner = w.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = app
+        .picks
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, c)| {
+            let mut text = format!(" {:>2} {}", i + 1, c.title);
+            if !c.subtitle.is_empty() {
+                text.push_str(&format!("  ·  {}", c.subtitle));
+            }
+            let text: String = text.chars().take(inner).collect();
+            if i == app.pick_sel {
+                let pad = inner.saturating_sub(text.chars().count());
+                Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style(app.accent))
+            } else {
+                Line::raw(text)
+            }
+        })
+        .collect();
+    lines.push(Line::styled(" Enter select · j k move · Esc cancel", dim()));
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(format!(" {} ", app.pick_title))
                 .border_style(Style::new().fg(Color::Yellow)),
         ),
         popup,

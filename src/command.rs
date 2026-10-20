@@ -36,6 +36,9 @@ pub enum Command {
     AddTo(String),
     Import(String),
     Artist,
+    Similar,
+    Album(Option<String>),
+    PlaylistSearch(String),
     Lyrics,
     Help,
 }
@@ -69,6 +72,9 @@ pub const COMMAND_NAMES: &[&str] = &[
     "addto",
     "import",
     "artist",
+    "similar",
+    "album",
+    "playlist",
     "lyrics",
     "help",
 ];
@@ -177,6 +183,14 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
             Import(arg.to_string())
         }
         "artist" | "ar" => Artist,
+        "similar" | "radio" | "sim" => Similar,
+        "album" | "albums" | "al" => Album((!arg.is_empty()).then(|| arg.to_string())),
+        "playlist" => {
+            if arg.is_empty() {
+                return Err("usage: :playlist \"query\"".into());
+            }
+            PlaylistSearch(arg.to_string())
+        }
         "lyrics" | "ly" => Lyrics,
         "help" | "h" => Help,
         other => return Err(format!("unknown command: :{other}  (try :help)")),
@@ -242,6 +256,19 @@ mod tests {
         assert_eq!(parse("artist"), Ok(Some(Command::Artist)));
         assert_eq!(parse(":ar"), Ok(Some(Command::Artist)));
         assert_eq!(parse("lyrics"), Ok(Some(Command::Lyrics)));
+        assert_eq!(parse("similar"), Ok(Some(Command::Similar)));
+        assert_eq!(parse(":radio"), Ok(Some(Command::Similar)));
+        assert_eq!(parse("album"), Ok(Some(Command::Album(None))));
+        assert_eq!(
+            parse("album daft punk"),
+            Ok(Some(Command::Album(Some("daft punk".into()))))
+        );
+        assert_eq!(
+            parse("playlist lofi"),
+            Ok(Some(Command::PlaylistSearch("lofi".into())))
+        );
+        assert!(parse("playlist").is_err());
+        assert_eq!(parse("playlists"), Ok(Some(Command::ShowPlaylists)));
     }
 
     #[test]
