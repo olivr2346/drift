@@ -29,8 +29,8 @@ Search, queue and play music with no account, no login and no browser.
 - **Song menu** - press `G` on a song to play, queue, add to a playlist, jump to the artist or see its info
 - **Command palette** - `:search`, `:seek`, `:vol`, `:import` and more, with completion and history
 - **Artist browsing** - press `ga` to see an artist's songs
+- **Similar songs** - press `gs` to see similar songs
 - **Audio visualizer** - a live visualizer while music plays
-- **Session restore** - your queue and playback position come back on the next launch
 - **Configurable** - volume, seek step, repeat/shuffle defaults and accent color in a single TOML file
 
 ## Installation
@@ -116,6 +116,7 @@ Press `/` to search, `Enter` to play, `a` to queue and `?` for the full list of 
 | `J` `K` | move a queue or playlist item down / up |
 | `G` | song menu |
 | `ga` | go to the artist |
+| `gs` | see similar songs |
 | `L` | toggle the lyrics panel |
 | `F` | fullscreen lyrics |
 | `/` `:` | search / command line |
@@ -135,6 +136,10 @@ Press `/` to search, `Enter` to play, `a` to queue and `?` for the full list of 
 | `:save name` `:load name` `:append name` | work with playlists |
 | `:addto name` `:delpl name` | add a song to / delete a playlist |
 | `:import URL` | import a YouTube / YouTube Music playlist |
+| `:album [query]` | open the selected song's album, or search albums |
+| `:playlist query` | search YouTube Music playlists |
+| `:similar` | radio: songs similar to the selected one (also `:radio`) |
+| `:artist` | songs by the selected song's artist |
 | `:lyrics` | toggle the lyrics panel |
 
 ## Lyrics
