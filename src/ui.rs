@@ -1133,6 +1133,14 @@ const HELP: &[(&str, &str)] = &[
         "save the queue as a playlist / load one (:save! n replaces an existing one)",
     ),
     (
+        ":savealbum [n]",
+        "save album or current album results as a playlist",
+    ),
+    (
+        ":saveresults [n]",
+        "save current results as a playlist",
+    ),
+    (
         ":append n  :delpl n",
         "append a playlist to the queue / delete it",
     ),
@@ -1281,7 +1289,10 @@ fn draw_collection_picker(f: &mut Frame, app: &App, area: Rect) {
             }
         })
         .collect();
-    lines.push(Line::styled(" Enter select · j k move · Esc cancel", dim()));
+    lines.push(Line::styled(
+        " Enter select · s save playlist · j k move · Esc cancel",
+        dim(),
+    ));
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(lines).block(
