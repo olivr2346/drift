@@ -5,6 +5,9 @@ pub struct Track {
     pub id: String,
     pub title: String,
     pub artist: String,
+    /* individual credited artists when the source gave them to us */
+    #[serde(default)]
+    pub artists: Vec<String>,
     #[serde(default)]
     pub album: Option<String>,
     #[serde(default)]
@@ -14,6 +17,16 @@ pub struct Track {
 impl Track {
     pub fn url(&self) -> String {
         format!("https://music.youtube.com/watch?v={}", self.id)
+    }
+
+    /* Individual artists: the structured list if we have one, else a guess
+     * made by splitting the display string (old saves, plain yt-dlp). */
+    pub fn artist_names(&self) -> Vec<String> {
+        if self.artists.is_empty() {
+            split_artists(&self.artist)
+        } else {
+            self.artists.clone()
+        }
     }
 
     pub fn label(&self) -> String {
@@ -29,21 +42,75 @@ pub struct Collection {
     pub artist: String,
 }
 
+/* names that contain a separator and must stay in one piece */
+const WHOLE_NAMES: &[&str] = &[
+    "Tyler, The Creator",
+    "Earth, Wind & Fire",
+    "Emerson, Lake & Palmer",
+    "Crosby, Stills, Nash & Young",
+    "Crosby, Stills & Nash",
+    "Simon & Garfunkel",
+    "Hall & Oates",
+    "Brooks & Dunn",
+    "Mumford & Sons",
+    "Belle & Sebastian",
+    "Sly & The Family Stone",
+    "Ike & Tina Turner",
+    "Bob Seger & The Silver Bullet Band",
+    "Hootie & the Blowfish",
+    "Florence & The Machine",
+    "Years & Years",
+    "Kool & The Gang",
+    "Gladys Knight & The Pips",
+    "Diana Ross & The Supremes",
+    "Smokey Robinson & The Miracles",
+    "Martha Reeves & The Vandellas",
+    "Huey Lewis & The News",
+    "Echo & the Bunnymen",
+    "Prince & The Revolution",
+    "Bruce Springsteen & The E Street Band",
+    "Tom Petty & The Heartbreakers",
+];
+
+/* credit separators, matched case-insensitively */
+const SEPARATORS: &[&str] = &[" & ", ", ", " feat. ", " feat ", " ft. ", " × "];
+
+fn starts_with_ci(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn push_name(out: &mut Vec<String>, raw: &str) {
+    let name = raw.trim();
+    if !name.is_empty() && !out.iter().any(|o| o == name) {
+        out.push(name.to_string());
+    }
+}
+
+/* Best-effort split of a flattened credit string. Only a fallback: prefer
+ * Track::artists, which comes straight from the source's own boundaries. */
 pub fn split_artists(credit: &str) -> Vec<String> {
-    const MARK: char = '\u{1}';
-    let mut s = credit.to_string();
-    for sep in [
-        " & ", ", ", " feat. ", " Feat. ", " feat ", " ft. ", " Ft. ", " × ",
-    ] {
-        s = s.replace(sep, &MARK.to_string());
-    }
     let mut out: Vec<String> = Vec::new();
-    for part in s.split(MARK) {
-        let name = part.trim();
-        if !name.is_empty() && !out.iter().any(|o| o == name) {
-            out.push(name.to_string());
+    let mut start = 0;
+    let mut i = 0;
+    while i < credit.len() {
+        let rest = &credit[i..];
+        let at_piece_start = credit[start..i].trim().is_empty();
+        if at_piece_start {
+            if let Some(name) = WHOLE_NAMES.iter().find(|n| starts_with_ci(rest, n)) {
+                i += name.len();
+                continue;
+            }
         }
+        if let Some(sep) = SEPARATORS.iter().find(|sep| starts_with_ci(rest, sep)) {
+            push_name(&mut out, &credit[start..i]);
+            i += sep.len();
+            start = i;
+            continue;
+        }
+        i += rest.chars().next().map_or(1, char::len_utf8);
     }
+    push_name(&mut out, &credit[start..]);
     out
 }
 
@@ -133,7 +200,43 @@ mod tests {
         assert_eq!(split_artists("A, B & C"), ["A", "B", "C"]);
         assert_eq!(split_artists("A feat. B"), ["A", "B"]);
         assert_eq!(split_artists("A, A"), ["A"]);
+        assert_eq!(split_artists("Tyler, The Creator"), ["Tyler, The Creator"]);
+        assert_eq!(
+            split_artists("Tyler, The Creator & Kali Uchis"),
+            ["Tyler, The Creator", "Kali Uchis"]
+        );
+        assert_eq!(
+            split_artists("Earth, Wind & Fire, Someone"),
+            ["Earth, Wind & Fire", "Someone"]
+        );
         assert!(split_artists("  ").is_empty());
+    }
+
+    #[test]
+    fn artist_splitting_edge_cases() {
+        assert_eq!(split_artists("hall & oates"), ["hall & oates"]);
+        assert_eq!(split_artists(" Tyler, The Creator "), ["Tyler, The Creator"]);
+        assert_eq!(split_artists("A Feat. B"), ["A", "B"]);
+        assert_eq!(
+            split_artists("Drake, Hall & Oates"),
+            ["Drake", "Hall & Oates"]
+        );
+        assert_eq!(split_artists("Beyoncé × Jay-Z"), ["Beyoncé", "Jay-Z"]);
+    }
+
+    #[test]
+    fn artist_names_prefers_structured_list() {
+        let mut t = Track {
+            id: "abcdefghijk".into(),
+            title: "T".into(),
+            artist: "Blood, Sweat & Tears".into(),
+            artists: vec!["Blood, Sweat & Tears".into()],
+            album: None,
+            duration: None,
+        };
+        assert_eq!(t.artist_names(), ["Blood, Sweat & Tears"]);
+        t.artists.clear();
+        assert_eq!(t.artist_names(), ["Blood", "Sweat", "Tears"]);
     }
 
     #[test]

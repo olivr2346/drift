@@ -1,4 +1,5 @@
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -176,30 +177,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 fn search_innertube(query: &str) -> Result<Page> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(12))
-        .user_agent(UA)
-        .build();
-    let body = json!({
-        "context": { "client": {
-            "clientName": "WEB_REMIX",
-            "clientVersion": client_version(),
-            "hl": "en",
-            "gl": "US",
-        }},
-        "query": query,
-        "params": SONGS_FILTER,
-    });
-    let resp = agent
-        .post(ENDPOINT)
-        .set("Origin", "https://music.youtube.com")
-        .set("Referer", "https://music.youtube.com/")
-        .set("Cookie", "SOCS=CAI")
-        .send_json(body)
-        .map_err(|e| anyhow!("request failed: {e}"))?;
-    let v: Value = resp
-        .into_json()
-        .context("invalid JSON from YouTube Music")?;
+    let v = post(ENDPOINT, json!({ "query": query, "params": SONGS_FILTER }))?;
     Ok(page_from(&v))
 }
 
@@ -232,18 +210,25 @@ fn find_continuation(v: &Value) -> Option<String> {
     }
 }
 
+/* one shared agent so paging and radio reuse the same connection */
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(12))
+            .user_agent(UA)
+            .build()
+    })
+}
+
 fn post(url: &str, mut body: Value) -> Result<Value> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(12))
-        .user_agent(UA)
-        .build();
     body["context"] = json!({ "client": {
         "clientName": "WEB_REMIX",
         "clientVersion": client_version(),
         "hl": "en",
         "gl": "US",
     }});
-    let resp = agent
+    let resp = agent()
         .post(url)
         .set("Origin", "https://music.youtube.com")
         .set("Referer", "https://music.youtube.com/")
@@ -316,13 +301,42 @@ fn find_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     }
 }
 
+fn column_runs(item: &Value, col: usize) -> Option<&Vec<Value>> {
+    item.get("flexColumns")
+        .and_then(|c| c.get(col))
+        .and_then(|c| c.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
+        .and_then(Value::as_array)
+}
+
 fn column_segments(item: &Value, col: usize) -> Vec<String> {
-    run_segments(
-        item.get("flexColumns")
-            .and_then(|c| c.get(col))
-            .and_then(|c| c.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
-            .and_then(Value::as_array),
-    )
+    run_segments(column_runs(item, col))
+}
+
+/* Artists are the runs that link to an artist/channel page ("UC..." browse
+ * ids); the "&" and "," between them are plain runs. Using the source's own
+ * boundaries means names that contain a separator stay in one piece. Names
+ * must also appear in `credit`, so a stray linked run can't leak in. Empty
+ * when the response carries no links (the caller falls back to guessing). */
+fn artist_names_from_runs(runs: Option<&Vec<Value>>, credit: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for run in runs.into_iter().flatten() {
+        let id = run
+            .pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str);
+        let text = run.get("text").and_then(Value::as_str);
+        let (Some(id), Some(text)) = (id, text) else {
+            continue;
+        };
+        let text = text.trim();
+        if id.starts_with("UC")
+            && !text.is_empty()
+            && credit.contains(text)
+            && !names.iter().any(|n| n == text)
+        {
+            names.push(text.to_string());
+        }
+    }
+    names
 }
 
 fn run_segments(runs: Option<&Vec<Value>>) -> Vec<String> {
@@ -384,6 +398,7 @@ fn parse_item(item: &Value) -> Option<Track> {
         .first()
         .cloned()
         .unwrap_or_else(|| "Unknown artist".into());
+    let artists = artist_names_from_runs(column_runs(item, 1), &artist);
     let album = meta
         .get(1)
         .filter(|a| !a.contains(" views") && !a.contains(" plays"))
@@ -393,6 +408,7 @@ fn parse_item(item: &Value) -> Option<Track> {
         id: id.to_string(),
         title,
         artist,
+        artists,
         album,
         duration,
     })
@@ -497,11 +513,13 @@ fn parse_panel_item(item: &Value) -> Option<Track> {
     if title.is_empty() {
         return None;
     }
-    let meta = run_segments(item.pointer("/longBylineText/runs").and_then(Value::as_array));
+    let byline = item.pointer("/longBylineText/runs").and_then(Value::as_array);
+    let meta = run_segments(byline);
     let artist = meta
         .first()
         .cloned()
         .unwrap_or_else(|| "Unknown artist".into());
+    let artists = artist_names_from_runs(byline, &artist);
     let album = meta
         .get(1)
         .filter(|a| {
@@ -520,6 +538,7 @@ fn parse_panel_item(item: &Value) -> Option<Track> {
         id: id.to_string(),
         title,
         artist,
+        artists,
         album,
         duration,
     })
@@ -585,11 +604,24 @@ pub fn parse_ytdlp_lines(text: &str) -> Vec<Track> {
                 .unwrap_or("Unknown artist")
                 .trim_end_matches(" - Topic")
                 .to_string();
+            /* newer yt-dlp lists each credited artist separately */
+            let artists: Vec<String> = v
+                .get("artists")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             let duration = v.get("duration").and_then(Value::as_f64).map(|d| d as u32);
             Some(Track {
                 id: id.to_string(),
                 title,
                 artist,
+                artists,
                 album: None,
                 duration,
             })
@@ -646,6 +678,36 @@ mod tests {
         assert_eq!(t.artist, "A & B");
         assert_eq!(t.album, None);
         assert_eq!(t.duration, Some(241));
+    }
+
+    #[test]
+    fn keeps_linked_artist_runs_whole() {
+        let link = |text: &str, id: &str| {
+            json!({"text": text, "navigationEndpoint": {"browseEndpoint": {"browseId": id}}})
+        };
+        let resp = json!([{"musicResponsiveListItemRenderer": {
+            "overlay": {"watchEndpoint": {"videoId": "abcdefghijk"}},
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": run("Song")},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [
+                    link("Tyler, The Creator", "UCaaaaaaaa"), {"text": " & "},
+                    link("Kali Uchis", "UCbbbbbbbb"), {"text": " • "},
+                    link("Album", "MPREb_cccc"), {"text": " • "}, {"text": "3:21"}
+                ]}}}
+            ]
+        }}]);
+        let t = &parse_search_response(&resp)[0];
+        assert_eq!(t.artist, "Tyler, The Creator & Kali Uchis");
+        assert_eq!(t.artists, ["Tyler, The Creator", "Kali Uchis"]);
+        assert_eq!(t.album.as_deref(), Some("Album"));
+    }
+
+    #[test]
+    fn reads_ytdlp_artists_list() {
+        let line = r#"{"id":"abcdefghijk","title":"T","artist":"A, B","artists":["A","B"],"duration":10}"#;
+        let t = parse_ytdlp_lines(line);
+        assert_eq!(t[0].artists, ["A", "B"]);
+        assert_eq!(t[0].artist, "A, B");
     }
 
     #[test]

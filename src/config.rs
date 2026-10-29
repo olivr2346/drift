@@ -74,6 +74,12 @@ pub struct Artist {
     pub popular_first: bool,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Discord {
+    pub client_id: String,
+}
+
 fn default_accent() -> Color {
     Color::Cyan
 }
@@ -97,6 +103,7 @@ pub struct Config {
     pub playback: Playback,
     pub artist: Artist,
     pub ui: Ui,
+    pub discord: Discord,
 }
 
 impl Config {
@@ -104,7 +111,7 @@ impl Config {
         Ok(Store::dir()?.join("config.toml"))
     }
 
-    pub fn render(p: &Playback, a: &Artist, u: &Ui) -> String {
+    pub fn render(p: &Playback, a: &Artist, u: &Ui, d: &Discord) -> String {
         let accent = match u.accent {
             Color::Reset => "reset",
             Color::Black => "black",
@@ -150,6 +157,12 @@ popular_first = {popular}
 #               light-cyan, white
 # Or use a hex value: \"#FF8800\"
 accent = \"{accent}\"
+
+[discord]
+# Show the current song in your Discord status. Create an application at
+# https://discord.com/developers/applications (its name is shown after
+# \"Listening to\") and paste its Application ID here. Empty means off.
+client_id = \"{client_id}\"
 ",
             volume = p.volume,
             shuffle = p.shuffle,
@@ -160,6 +173,7 @@ accent = \"{accent}\"
             vstep = p.volume_step,
             popular = a.popular_first,
             accent = accent,
+            client_id = d.client_id,
         )
     }
 
@@ -174,7 +188,7 @@ accent = \"{accent}\"
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = Self::write(&Self::render(&Playback::default(), &Artist::default(), &Ui::default()));
+                let _ = Self::write(&Self::render(&Playback::default(), &Artist::default(), &Ui::default(), &Discord::default()));
                 return (Config::default(), None);
             }
             Err(e) => {
@@ -253,7 +267,7 @@ pub fn migrate_legacy() {
             let _ = Session::write(&s);
         }
     }
-    let _ = Config::write(&Config::render(&p, &Artist::default(), &Ui::default()));
+    let _ = Config::write(&Config::render(&p, &Artist::default(), &Ui::default(), &Discord::default()));
 }
 
 #[cfg(test)]
@@ -262,7 +276,7 @@ mod tests {
 
     #[test]
     fn default_file_parses_back() {
-        let text = Config::render(&Playback::default(), &Artist::default(), &Ui::default());
+        let text = Config::render(&Playback::default(), &Artist::default(), &Ui::default(), &Discord::default());
         let c: Config = toml::from_str(&text).unwrap();
         let d = Playback::default();
         assert_eq!(c.playback.volume, d.volume);
@@ -329,7 +343,7 @@ mod tests {
 
         // Roundtrip: render then parse
         let u = Ui { accent: Color::Blue };
-        let text = Config::render(&Playback::default(), &Artist::default(), &u);
+        let text = Config::render(&Playback::default(), &Artist::default(), &u, &Discord::default());
         let c: Config = toml::from_str(&text).unwrap();
         assert_eq!(c.ui.accent, Color::Blue);
     }

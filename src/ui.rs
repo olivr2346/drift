@@ -10,11 +10,19 @@ use crate::model::{fmt_time, Track};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/* Cursor row: accent-colored bold text plus a bar, no filled background. */
+const CURSOR: &str = "▎";
+
 fn selected_style(accent: Color) -> Style {
-    Style::new()
-        .fg(Color::Black)
-        .bg(accent)
-        .add_modifier(Modifier::BOLD)
+    Style::new().fg(accent).add_modifier(Modifier::BOLD)
+}
+
+/* Swap the leading space of a menu line for the cursor bar. */
+fn cursor_text(text: &str) -> String {
+    match text.strip_prefix(' ') {
+        Some(rest) => format!("{CURSOR}{rest}"),
+        None => text.to_string(),
+    }
 }
 
 fn header_style() -> Style {
@@ -115,21 +123,19 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         ("Queue", app.queue.len()),
         ("Playlists", app.store.playlists.len()),
     ];
-    let pill = Style::new().fg(Color::Black).bg(app.accent);
+    let active = Style::new()
+        .fg(app.accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let mut spans: Vec<Span> = Vec::new();
     for (i, (title, count)) in titles.into_iter().enumerate() {
+        spans.push(Span::raw("  "));
         if i == app.view.idx() {
-            spans.push(Span::styled("▐", Style::new().fg(app.accent)));
-            spans.push(Span::styled(format!(" {title} "), pill.bold()));
-            spans.push(Span::styled(format!("{count} "), pill));
-            spans.push(Span::styled("▌", Style::new().fg(app.accent)));
+            spans.push(Span::styled(format!("{title} {count}"), active));
         } else {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!(" {title} "), Style::new().fg(Color::Gray)));
-            spans.push(Span::styled(format!("{count} "), dim()));
-            spans.push(Span::raw(" "));
+            spans.push(Span::styled(title, Style::new().fg(Color::Gray)));
+            spans.push(Span::styled(format!(" {count}"), dim()));
         }
-        spans.push(Span::raw(" "));
+        spans.push(Span::raw("  "));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), tabs);
 
@@ -215,6 +221,7 @@ fn track_table<'a>(rows: Vec<Row<'a>>, show_album: bool, block: Block<'a>, accen
         .block(block)
         .column_spacing(1)
         .row_highlight_style(selected_style(accent))
+        .highlight_symbol(CURSOR)
 }
 
 fn empty_hint(f: &mut Frame, block: Block, area: Rect, lines: &[&str]) {
@@ -364,7 +371,8 @@ fn draw_playlists(f: &mut Frame, app: &mut App, area: Rect) {
     )
     .header(Row::new(vec!["", "Name", "Songs"]).style(header_style()))
     .block(block)
-    .row_highlight_style(selected_style(app.accent));
+    .row_highlight_style(selected_style(app.accent))
+    .highlight_symbol(CURSOR);
     f.render_stateful_widget(table, left, &mut app.states[View::Playlists.idx()]);
 
     let sel = app.selected();
@@ -694,7 +702,7 @@ fn draw_toast(f: &mut Frame, app: &App, body: Rect) {
         Level::Error => ("✖", Color::Red),
         Level::Info => ("●", Color::Green),
     };
-    let max_text = (body.width as usize).saturating_sub(8).min(70);
+    let max_text = (body.width as usize).saturating_sub(8).min(120);
     let mut text: String = s.text.lines().next().unwrap_or("").to_string();
     if text.chars().count() > max_text {
         text = text.chars().take(max_text.saturating_sub(1)).collect::<String>() + "…";
@@ -931,7 +939,7 @@ fn draw_palette(f: &mut Frame, app: &App, area: Rect) {
             let text: String = text.chars().take(width).collect();
             lines.push(if Some(i) == sel {
                 let pad = width.saturating_sub(text.chars().count());
-                Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style(app.accent))
+                Line::styled(format!("{}{}", cursor_text(&text), " ".repeat(pad)), selected_style(app.accent))
             } else {
                 Line::from(vec![
                     Span::styled(
@@ -1001,7 +1009,7 @@ fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
                 }
                 let text: String = text.chars().take(width).collect();
                 let pad = width.saturating_sub(text.chars().count());
-                return Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style(accent));
+                return Line::styled(format!("{}{}", cursor_text(&text), " ".repeat(pad)), selected_style(accent));
             }
             let danger = matches!(
                 it.action,
@@ -1122,7 +1130,7 @@ const HELP: &[(&str, &str)] = &[
     (":clear", "empty the queue"),
     (
         ":save n  :load n",
-        "save the queue as a playlist / load one",
+        "save the queue as a playlist / load one (:save! n replaces an existing one)",
     ),
     (
         ":append n  :delpl n",
@@ -1218,7 +1226,7 @@ fn draw_artist_picker(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, name)| {
             let text = format!(" {} {name}", i + 1);
             if i == app.artist_sel {
-                Line::styled(text, selected_style(app.accent))
+                Line::styled(cursor_text(&text), selected_style(app.accent))
             } else {
                 Line::raw(text)
             }
@@ -1267,7 +1275,7 @@ fn draw_collection_picker(f: &mut Frame, app: &App, area: Rect) {
             let text: String = text.chars().take(inner).collect();
             if i == app.pick_sel {
                 let pad = inner.saturating_sub(text.chars().count());
-                Line::styled(format!("{text}{}", " ".repeat(pad)), selected_style(app.accent))
+                Line::styled(format!("{}{}", cursor_text(&text), " ".repeat(pad)), selected_style(app.accent))
             } else {
                 Line::raw(text)
             }
@@ -1350,6 +1358,7 @@ mod tests {
             id: id.into(),
             title: title.into(),
             artist: "Someone".into(),
+            artists: Vec::new(),
             album: None,
             duration: Some(90),
         };

@@ -9,9 +9,10 @@ use ratatui::widgets::TableState;
 use crate::command::{self, Amount, Command, COMMAND_NAMES};
 use crate::config::{self, Config};
 use crate::lyrics::{self, Lyrics};
-use crate::model::{split_artists, Collection, RepeatMode, Track};
+use crate::model::{Collection, RepeatMode, Track};
+use crate::discord::Discord;
 use crate::mpris::{Cmd, Mpris};
-use crate::player::{Player, PlayerEvent};
+use crate::player::{self, Player, PlayerEvent};
 use crate::session::Session;
 use crate::store::Store;
 use crate::ytmusic::{self, Kind, Page};
@@ -37,6 +38,10 @@ pub enum AppEvent {
         result: Result<Vec<Collection>, String>,
     },
     Media(Cmd),
+    Audio {
+        id: String,
+        result: Result<std::path::PathBuf, String>,
+    },
 }
 
 const FIRST_PAGE: usize = 20;
@@ -201,6 +206,8 @@ pub struct App {
     radio_played: HashSet<usize>,
     resume_radio: bool,
     fail_streak: u8,
+    want: Option<String>,
+    fetching: Option<String>,
     result_cursor: Option<usize>,
     buffered: Vec<Track>,
     next_page: Option<String>,
@@ -210,6 +217,8 @@ pub struct App {
     on_radio: bool,
     similar_load: Option<u64>,
     mpris: Option<Mpris>,
+    discord: Option<Discord>,
+    owns_session: bool,
     seek_step: f64,
     volume_step: f64,
     autoplay: bool,
@@ -248,6 +257,8 @@ impl App {
                 let _ = t.send(AppEvent::Media(c));
             })
         };
+        let discord = Discord::new(&cfg.discord.client_id);
+        let owns_session = Session::claim();
         let mut app = App {
             view: View::Results,
             mode: Mode::Normal,
@@ -295,6 +306,8 @@ impl App {
             radio_played: HashSet::new(),
             resume_radio: false,
             fail_streak: 0,
+            want: None,
+            fetching: None,
             result_cursor: None,
             buffered: Vec::new(),
             next_page: None,
@@ -304,6 +317,8 @@ impl App {
             on_radio: false,
             similar_load: None,
             mpris,
+            discord,
+            owns_session,
             seek_step: p.seek_step,
             volume_step: p.volume_step,
             autoplay: p.autoplay,
@@ -321,7 +336,7 @@ impl App {
             tx,
             rng: seed,
         };
-        if p.restore_session {
+        if p.restore_session && owns_session {
             let s = Session::load();
             app.resume = s
                 .current
@@ -346,9 +361,13 @@ impl App {
         }
         self.player = None;
         self.mpris = None;
+        self.discord = None;
     }
 
     fn save_session(&mut self, force: bool) -> Result<()> {
+        if !self.owns_session {
+            return Ok(());
+        }
         let session = Session {
             queue: self.queue.clone(),
             current: self.current,
@@ -390,6 +409,11 @@ impl App {
         self.load_more();
         self.sync_lyrics();
         self.sync_mpris();
+        self.sync_discord();
+        /* open the picker once nothing else is being typed, so keys aren't hijacked */
+        if self.mode == Mode::Normal && !self.picks.is_empty() {
+            self.mode = Mode::CollectionPick;
+        }
         if self.tick.is_multiple_of(50) {
             match self.save_session(false) {
                 Ok(()) => self.save_failed = false,
@@ -812,6 +836,11 @@ impl App {
         let len = self.queue.len();
         let at = self.current.map_or(0, |c| (c + 1).min(len));
         self.queue.insert(at, t);
+        self.played = self
+            .played
+            .iter()
+            .map(|&i| if i >= at { i + 1 } else { i })
+            .collect();
         self.info(format!("Playing next: {label}"));
     }
 
@@ -1103,7 +1132,8 @@ impl App {
                 self.repeat = m.unwrap_or_else(|| self.repeat.cycle());
                 self.info(format!("Repeat: {}", self.repeat.label()));
             }
-            Command::Save(name) => self.save_playlist(&name),
+            Command::Save(name) => self.save_playlist(&name, false),
+            Command::SaveForce(name) => self.save_playlist(&name, true),
             Command::Load(name) => match self.store.resolve(&name) {
                 Some(n) => self.load_playlist(&n, true),
                 None => self.error(format!("no playlist named '{name}'")),
@@ -1147,7 +1177,7 @@ impl App {
         let Some(track) = self.artist_target() else {
             return self.error("No song selected");
         };
-        let names = split_artists(&track.artist);
+        let names = track.artist_names();
         if names.is_empty() || track.artist == "Unknown artist" {
             return self.error("No artist known for this song");
         }
@@ -1219,7 +1249,7 @@ impl App {
             tracks.extend(found.into_iter().filter(|t| {
                 !known.contains(&t.id)
                     && (t.artist.to_lowercase() == wanted
-                        || split_artists(&t.artist)
+                        || t.artist_names()
                             .iter()
                             .any(|a| a.to_lowercase() == wanted))
             }));
@@ -1234,7 +1264,8 @@ impl App {
         let Some(album) = track.album.clone() else {
             return self.error("No album known for this song");
         };
-        let artist = split_artists(&track.artist)
+        let artist = track
+            .artist_names()
             .into_iter()
             .next()
             .unwrap_or_default();
@@ -1334,6 +1365,13 @@ impl App {
         if let Some(mut m) = self.mpris.take() {
             m.update(self.now_track(), self.play_state, self.position);
             self.mpris = Some(m);
+        }
+    }
+
+    fn sync_discord(&mut self) {
+        if let Some(mut d) = self.discord.take() {
+            d.update(self.now_track(), self.play_state, self.position);
+            self.discord = Some(d);
         }
     }
 
@@ -1449,7 +1487,6 @@ impl App {
                         self.picks = list;
                         self.pick_sel = 0;
                         self.pick_title = title;
-                        self.mode = Mode::CollectionPick;
                     }
                     Err(e) => self.error(e),
                 }
@@ -1465,6 +1502,7 @@ impl App {
                     Err(e) => LyricsState::Failed(e),
                 };
             }
+            AppEvent::Audio { id, result } => self.on_audio(id, result),
             AppEvent::Player(generation, pe) => {
                 if generation == self.player_gen {
                     self.on_player(pe);
@@ -1546,6 +1584,7 @@ impl App {
             PlayerEvent::FileLoaded => {
                 self.play_state = PlayState::Playing;
                 self.fail_streak = 0;
+                self.prefetch_next();
                 if let Some((id, pos)) = self.resume.take() {
                     let ok = self.now_track().is_some_and(|t| {
                         t.id == id && t.duration.is_none_or(|d| pos < f64::from(d) - 1.0)
@@ -1567,7 +1606,7 @@ impl App {
                 if self.fail_streak >= 3 {
                     self.stop_playback();
                     self.error(format!(
-                        "Playback failed 3 times in a row ({msg}). Update yt-dlp: yt-dlp -U"
+                        "Playback failed 3 times in a row: {msg}"
                     ));
                 } else {
                     self.error(format!(
@@ -1583,6 +1622,60 @@ impl App {
                     self.error("mpv exited unexpectedly; it will restart on next play");
                 }
             }
+        }
+    }
+
+    fn fetch_audio(&mut self, id: &str) {
+        if self.fetching.as_deref() == Some(id) {
+            return;
+        }
+        self.fetching = Some(id.to_string());
+        let tx = self.tx.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            let result = player::fetch_audio(&id);
+            let _ = tx.send(AppEvent::Audio { id, result });
+        });
+    }
+
+    fn load_track(&mut self, id: &str) {
+        self.want = Some(id.to_string());
+        match player::cached_audio(id) {
+            Some(path) => self.on_audio(id.to_string(), Ok(path)),
+            None => self.fetch_audio(id),
+        }
+    }
+
+    fn on_audio(&mut self, id: String, result: Result<std::path::PathBuf, String>) {
+        if self.fetching.as_deref() == Some(id.as_str()) {
+            self.fetching = None;
+        }
+        if self.want.as_deref() != Some(id.as_str()) {
+            return;
+        }
+        self.want = None;
+        match result {
+            Ok(path) => {
+                let path = path.to_string_lossy().into_owned();
+                if let Err(e) = self.with_player(|p| p.load(&path)) {
+                    self.play_state = PlayState::Stopped;
+                    self.error(format!("Playback failed: {e:#}"));
+                }
+            }
+            Err(msg) => self.on_player(PlayerEvent::LoadError(msg)),
+        }
+    }
+
+    fn prefetch_next(&mut self) {
+        if self.shuffle || self.on_radio || self.fetching.is_some() {
+            return;
+        }
+        let Some(next) = self.current.and_then(|c| self.queue.get(c + 1)) else {
+            return;
+        };
+        let id = next.id.clone();
+        if player::cached_audio(&id).is_none() {
+            self.fetch_audio(&id);
         }
     }
 
@@ -1606,14 +1699,8 @@ impl App {
             _ => 0.0,
         };
         self.duration = track.duration.map_or(0.0, f64::from);
-        let url = track.url();
-        match self.with_player(|p| p.load(&url)) {
-            Ok(()) => self.info(format!("♪ {}", track.label())),
-            Err(e) => {
-                self.play_state = PlayState::Stopped;
-                self.error(format!("Playback failed: {e:#}"));
-            }
-        }
+        self.info(format!("♪ {}", track.label()));
+        self.load_track(&track.id);
     }
 
     fn play_default(&mut self) {
@@ -1690,6 +1777,12 @@ impl App {
         let Some(track) = self.radio.get(i).cloned() else {
             return;
         };
+        if !self.on_radio && self.current.is_some() {
+            /* leaving the queue for a list: what is queued now counts as done,
+            only songs added from here on play after this one */
+            self.current = self.queue.len().checked_sub(1);
+            self.played = (0..self.queue.len()).collect();
+        }
         self.on_radio = true;
         self.resume_radio = true;
         self.result_cursor = Some(i);
@@ -1698,14 +1791,8 @@ impl App {
         self.play_state = PlayState::Loading;
         self.position = 0.0;
         self.duration = track.duration.map_or(0.0, f64::from);
-        let url = track.url();
-        match self.with_player(|p| p.load(&url)) {
-            Ok(()) => self.info(format!("♪ {}", track.label())),
-            Err(e) => {
-                self.play_state = PlayState::Stopped;
-                self.error(format!("Playback failed: {e:#}"));
-            }
-        }
+        self.info(format!("♪ {}", track.label()));
+        self.load_track(&track.id);
     }
 
     fn set_pause(&mut self, pause: bool) {
@@ -1736,6 +1823,7 @@ impl App {
     }
 
     fn stop_playback(&mut self) {
+        self.want = None;
         if let Some(p) = self.player.as_mut() {
             let _ = p.stop();
         }
@@ -2068,17 +2156,25 @@ impl App {
         }
     }
 
-    fn save_playlist(&mut self, name: &str) {
+    fn save_playlist(&mut self, name: &str, force: bool) {
         if self.queue.is_empty() {
             return self.error("Queue is empty — nothing to save");
         }
+        let key = self
+            .store
+            .resolve_exact(name)
+            .unwrap_or_else(|| name.to_string());
+        let exists = self.store.playlists.get(&key).is_some_and(|l| !l.is_empty());
+        if exists && !force {
+            return self.error(format!(
+                "Playlist \u{201c}{key}\u{201d} already exists. :save! {key} replaces it, :append {key} adds the queue to the end"
+            ));
+        }
         let n = self.queue.len();
-        self.store
-            .playlists
-            .insert(name.to_string(), self.queue.clone());
+        self.store.playlists.insert(key.clone(), self.queue.clone());
         if self.persist() {
             self.info(format!(
-                "Saved {n} tracks to playlist \u{201c}{name}\u{201d}"
+                "Saved {n} tracks to playlist \u{201c}{key}\u{201d}"
             ));
         }
     }
@@ -2242,6 +2338,7 @@ mod tests {
             id: id.into(),
             title: title.into(),
             artist: "Artist".into(),
+            artists: Vec::new(),
             album: None,
             duration: Some(100),
         }

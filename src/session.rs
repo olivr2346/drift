@@ -22,6 +22,37 @@ impl Session {
         Ok(dir.join("drift").join("session.json"))
     }
 
+    /* The first drift to start owns the saved session. Later ones neither
+    restore nor overwrite it. The lock goes away when the process exits. */
+    #[cfg(unix)]
+    pub fn claim() -> bool {
+        use std::os::unix::io::AsRawFd;
+        let Ok(path) = Self::path().map(|p| p.with_file_name("session.lock")) else {
+            return true;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let Ok(file) = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        else {
+            return true;
+        };
+        let ok = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if ok {
+            std::mem::forget(file);
+        }
+        ok
+    }
+
+    #[cfg(not(unix))]
+    pub fn claim() -> bool {
+        true
+    }
+
     pub fn exists() -> bool {
         Self::path().is_ok_and(|p| p.exists())
     }
@@ -75,6 +106,7 @@ mod tests {
             id: id.into(),
             title: "T".into(),
             artist: "A".into(),
+            artists: Vec::new(),
             album: None,
             duration: Some(200),
         }

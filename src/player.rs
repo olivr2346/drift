@@ -140,8 +140,7 @@ impl Player {
             "--really-quiet",
             "--audio-display=no",
             "--force-window=no",
-            "--ytdl=yes",
-            "--ytdl-format=bestaudio/best",
+            "--ytdl=no",
             "--cache=yes",
             "--demuxer-max-bytes=32MiB",
         ])
@@ -211,16 +210,44 @@ impl Player {
         ] {
             player.send(json!(["observe_property", id, prop]))?;
         }
+        player.send(json!(["request_log_messages", "error"]))?;
 
         std::thread::spawn(move || {
+            let mut reason: Option<String> = None;
             for line in BufReader::new(reader).lines() {
                 let Ok(line) = line else { break };
                 let Ok(v) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                if let Some(ev) = parse_event(&v) {
-                    on_event(ev);
+                match v.get("event").and_then(Value::as_str) {
+                    Some("log-message") => {
+                        let prefix = v.get("prefix").and_then(Value::as_str).unwrap_or("");
+                        let text = v.get("text").and_then(Value::as_str).unwrap_or("").trim();
+                        match text.strip_prefix("ERROR: ") {
+                            Some(t) if prefix == "ytdl_hook" => reason = Some(ytdl_reason(t)),
+                            _ if reason.is_none() && !text.is_empty() && !text.starts_with("Failed to open") => {
+                                reason = Some(text.lines().next().unwrap_or(text).to_string());
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    Some("start-file") => reason = None,
+                    _ => {}
                 }
+                let Some(mut ev) = parse_event(&v) else {
+                    continue;
+                };
+                match &mut ev {
+                    PlayerEvent::LoadError(msg) => {
+                        if let Some(r) = reason.take() {
+                            *msg = r;
+                        }
+                    }
+                    PlayerEvent::FileLoaded => reason = None,
+                    _ => {}
+                }
+                on_event(ev);
             }
             on_event(PlayerEvent::Died);
         });
@@ -241,9 +268,9 @@ impl Player {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    pub fn load(&mut self, url: &str) -> Result<()> {
+    pub fn load(&mut self, path: &str) -> Result<()> {
         self.send(json!(["set_property", "pause", false]))?;
-        self.send(json!(["loadfile", url, "replace"]))
+        self.send(json!(["loadfile", path, "replace"]))
     }
 
     pub fn set_pause(&mut self, pause: bool) -> Result<()> {
@@ -280,6 +307,82 @@ impl Drop for Player {
         let _ = self.child.wait();
         ipc::cleanup(&self.sock_path);
     }
+}
+
+const KEEP_FILES: usize = 40;
+
+fn audio_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("drift")
+        .join("audio")
+}
+
+pub fn cached_audio(id: &str) -> Option<PathBuf> {
+    std::fs::read_dir(audio_dir())
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(id))
+}
+
+pub fn fetch_audio(id: &str) -> Result<PathBuf, String> {
+    if let Some(path) = cached_audio(id) {
+        return Ok(path);
+    }
+    let dir = audio_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(["-f", "bestaudio/best", "--no-playlist", "--no-warnings", "--no-progress", "--no-mtime"])
+        .arg("-P")
+        .arg(&dir)
+        .args(["-o", "%(id)s.%(ext)s"])
+        .arg(format!("https://music.youtube.com/watch?v={id}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    crate::sys::no_window(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not run yt-dlp ({e}); is it installed and on PATH?"))?;
+    if let Some(path) = cached_audio(id).filter(|_| out.status.success()) {
+        prune(&dir);
+        return Ok(path);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(stderr
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("ERROR: "))
+        .map(ytdl_reason)
+        .unwrap_or_else(|| "yt-dlp downloaded nothing".into()))
+}
+
+fn prune(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<_> = entries
+        .flatten()
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if files.len() > KEEP_FILES {
+        files.sort();
+        for (_, path) in &files[..files.len() - KEEP_FILES] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub fn ytdl_reason(text: &str) -> String {
+    let text = text.split("; please report").next().unwrap_or(text).trim();
+    let text = match text.strip_prefix('[').and_then(|t| t.split_once("] ")) {
+        Some((_, rest)) => match rest.split_once(": ") {
+            Some((id, msg)) if id.len() == 11 && !id.contains(' ') => msg,
+            _ => rest,
+        },
+        None => text,
+    };
+    text.trim().to_string()
 }
 
 fn parse_event(v: &Value) -> Option<PlayerEvent> {
@@ -357,6 +460,19 @@ mod tests {
         }
         assert!(loaded, "file-loaded not seen");
         assert!(eof, "end-of-file not seen");
+    }
+
+    #[test]
+    fn ytdl_reason_is_trimmed() {
+        assert_eq!(
+            ytdl_reason("[youtube] dQw4w9WgXcQ: Sign in to confirm you're not a bot. Use --cookies. \n"),
+            "Sign in to confirm you're not a bot. Use --cookies."
+        );
+        assert_eq!(
+            ytdl_reason("[youtube] dQw4w9WgXcQ: Failed to extract any player response; please report this issue on  https://x"),
+            "Failed to extract any player response"
+        );
+        assert_eq!(ytdl_reason("Unsupported URL: foo"), "Unsupported URL: foo");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod app;
 mod command;
 mod config;
+mod discord;
 mod lyrics;
 mod model;
 mod mpris;

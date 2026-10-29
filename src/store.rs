@@ -10,6 +10,32 @@ use crate::model::Track;
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Store {
     pub playlists: BTreeMap<String, Vec<Track>>,
+    /* what the file looked like when we last read or wrote it */
+    #[serde(skip)]
+    base: BTreeMap<String, Vec<Track>>,
+}
+
+/* keep whatever another drift wrote, but apply the playlists this one changed */
+fn merge(
+    base: &BTreeMap<String, Vec<Track>>,
+    mine: &BTreeMap<String, Vec<Track>>,
+    disk: BTreeMap<String, Vec<Track>>,
+) -> BTreeMap<String, Vec<Track>> {
+    let mut out = disk;
+    for name in base.keys().chain(mine.keys()) {
+        if base.get(name) == mine.get(name) {
+            continue;
+        }
+        match mine.get(name) {
+            Some(list) => {
+                out.insert(name.clone(), list.clone());
+            }
+            None => {
+                out.remove(name);
+            }
+        }
+    }
+    out
 }
 
 pub fn write_atomic(path: &Path, text: &str) -> Result<()> {
@@ -84,7 +110,10 @@ impl Store {
             }
         };
         match serde_json::from_str::<Store>(&text) {
-            Ok(s) => (s, None),
+            Ok(mut s) => {
+                s.base = s.playlists.clone();
+                (s, None)
+            }
             Err(e) => {
                 let bak = path.with_extension("json.bak");
                 let _ = fs::rename(&path, &bak);
@@ -99,8 +128,18 @@ impl Store {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
-        write_atomic(&Self::path()?, &serde_json::to_string_pretty(self)?)
+    fn read_disk() -> Option<BTreeMap<String, Vec<Track>>> {
+        let text = fs::read_to_string(Self::path().ok()?).ok()?;
+        serde_json::from_str::<Store>(&text).ok().map(|s| s.playlists)
+    }
+
+    pub fn save(&mut self) -> Result<()> {
+        if let Some(disk) = Self::read_disk() {
+            self.playlists = merge(&self.base, &self.playlists, disk);
+        }
+        write_atomic(&Self::path()?, &serde_json::to_string_pretty(&*self)?)?;
+        self.base = self.playlists.clone();
+        Ok(())
     }
 
     pub fn resolve_exact(&self, name: &str) -> Option<String> {
@@ -133,6 +172,33 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_keeps_other_instances_changes() {
+        let t = |id: &str| Track {
+            id: id.into(),
+            title: "T".into(),
+            artist: "A".into(),
+            artists: Vec::new(),
+            album: None,
+            duration: None,
+        };
+        let base: BTreeMap<String, Vec<Track>> = BTreeMap::from([
+            ("a".to_string(), vec![t("aaaaaaaaaaa")]),
+            ("b".to_string(), vec![]),
+        ]);
+        let mut mine = base.clone();
+        mine.insert("c".into(), vec![t("ccccccccccc")]);
+        mine.remove("b");
+        let mut disk = base.clone();
+        disk.insert("d".into(), vec![t("ddddddddddd")]);
+        disk.get_mut("a").unwrap().push(t("eeeeeeeeeee"));
+
+        let out = merge(&base, &mine, disk);
+        let names: Vec<&str> = out.keys().map(String::as_str).collect();
+        assert_eq!(names, ["a", "c", "d"]);
+        assert_eq!(out["a"].len(), 2);
+    }
 
     #[test]
     fn exact_ignores_prefixes() {

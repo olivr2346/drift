@@ -30,6 +30,7 @@ pub enum Command {
     Shuffle,
     Repeat(Option<RepeatMode>),
     Save(String),
+    SaveForce(String),
     Load(String),
     Append(String),
     DeletePlaylist(String),
@@ -172,6 +173,7 @@ pub fn parse(line: &str) -> Result<Option<Command>, String> {
             other => return Err(format!(":repeat expects off|all|one, got '{other}'")),
         },
         "save" | "w" => Save(name_arg(arg, "save")?),
+        "save!" | "w!" => SaveForce(name_arg(arg, "save!")?),
         "load" | "e" => Load(name_arg(arg, "load")?),
         "append" => Append(name_arg(arg, "append")?),
         "delpl" | "deletepl" | "delete" => DeletePlaylist(name_arg(arg, "delpl")?),
@@ -278,5 +280,9 @@ mod tests {
             Ok(Some(Command::Save("my mix".into())))
         );
         assert!(parse("save").is_err());
+        assert_eq!(
+            parse("save! my mix"),
+            Ok(Some(Command::SaveForce("my mix".into())))
+        );
     }
 }

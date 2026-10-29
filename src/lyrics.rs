@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::model::{parse_clock, split_artists, Track};
+use crate::model::{parse_clock, Track};
 
 const SEARCH: &str = "https://lrclib.net/api/search";
 const UA: &str = concat!("drift/", env!("CARGO_PKG_VERSION"));
@@ -102,7 +102,7 @@ fn pick(entries: &[Value], duration: Option<u32>) -> Option<Lyrics> {
         .filter(|e| drift(e) <= MAX_DRIFT)
         .filter_map(|e| from_entry(e).map(|l| (!l.synced, drift(e), l)))
         .collect();
-    found.sort_by(|a, b| (a.0, a.1).partial_cmp(&(b.0, b.1)).unwrap());
+    found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
     found.into_iter().next().map(|(_, _, l)| l)
 }
 
@@ -122,7 +122,8 @@ fn query(params: &[(&str, &str)]) -> Result<Vec<Value>, String> {
 }
 
 pub fn fetch(track: &Track) -> Result<Option<Lyrics>, String> {
-    let artist = split_artists(&track.artist)
+    let artist = track
+        .artist_names()
         .into_iter()
         .next()
         .unwrap_or_default();

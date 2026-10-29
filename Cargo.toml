@@ -16,6 +16,7 @@ toml = "0.8"
 ureq = { version = "2", features = ["json"] }
 dirs = "5"
 libc = "0.2"
+discord-rich-presence = "1.1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
