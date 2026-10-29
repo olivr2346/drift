@@ -167,6 +167,9 @@ popular_first = false
 
 [ui]
 accent = "cyan"       # a color name or a hex value like "#FF8800"
+
+[discord]
+client_id = ""        # change this for Discord RPC to work in Drift         
 ```
 
 Set `DRIFT_CONFIG_DIR` or `DRIFT_STATE_DIR` to change where Drift keeps its config, playlists and session.
