@@ -55,7 +55,7 @@ makepkg -si
 
 ### Install script
 
-On Arch, Debian/Ubuntu, Fedora and Void, the install script installs the dependencies and builds Drift with cargo:
+On Arch, Debian/Ubuntu, Fedora, openSUSE, Gentoo & Void the install script installs the dependencies and builds Drift with cargo:
 
 ```bash
 git clone https://github.com/socatlolmeow/drift.git
