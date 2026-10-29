@@ -806,6 +806,8 @@ const CMD_INFO: &[(&str, &str)] = &[
     ("shuffle", "toggle shuffle"),
     ("repeat", "repeat  ·  off | all | one"),
     ("save", "save the queue as a playlist"),
+    ("savealbum", "save album as a playlist  ·  savealbum [name]"),
+    ("saveresults", "save results as a playlist  ·  saveresults [name]"),
     ("load", "load a playlist into the queue"),
     ("append", "append a playlist to the queue"),
     ("delpl", "delete a playlist"),
